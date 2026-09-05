@@ -15,6 +15,7 @@ var (
 	ErrEmptyPasswordSource    = errors.New("-password-env and -password-file require a nonempty value")
 	ErrInvalidHeader          = errors.New("-header must use Name=Value")
 	ErrInvalidHeaderEnv       = errors.New("-header-env must use Name=ENV")
+	ErrInvalidField           = errors.New("-field must use Name=Value with a nonempty name")
 	ErrEmptyHeaderEnv         = errors.New("header environment variable is unset or empty")
 	ErrEmptyPasswordEnv       = errors.New("password environment variable is unset or empty")
 	ErrPasswordFileRead       = errors.New("cannot read password file")

@@ -39,7 +39,7 @@ func (*observedInput) Close() error { return nil }
 func TestHelpDoesNotReadInputOrExposeArguments(t *testing.T) {
 	input := new(observedInput)
 	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), []string{"-password", "secret-value", "-header", "X-Example=secret-value", "-help"}, input, &stdout, &stderr)
+	code := run(t.Context(), []string{"-password", "secret-value", "-header", "X-Example=secret-value", "-field", "name=secret-value", "-help"}, input, &stdout, &stderr)
 	if code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), "Usage: slogx-collector") || !strings.Contains(stdout.String(), "-journal-dir") {
 		t.Fatalf("help returned %d; stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -71,6 +71,8 @@ func TestInvalidConfigurationDoesNotReadInput(t *testing.T) {
 		{name: "negative retries", args: []string{"-max-retries", "-1"}},
 		{name: "decreasing retry delay", args: []string{"-retry-interval", "2s", "-max-retry-interval", "1s"}},
 		{name: "malformed header", args: []string{"-header", "secret-value"}},
+		{name: "malformed field", args: []string{"-field", "secret-value"}},
+		{name: "empty field name", args: []string{"-field", "=secret-value"}},
 		{name: "malformed environment header", args: []string{"-header-env", "secret-value"}},
 		{name: "empty environment header", args: []string{"-header-env", "Authorization=SLOGX_COLLECT_TEST_EMPTY"}},
 		{name: "empty environment password", args: []string{"-password-env", "SLOGX_COLLECT_TEST_EMPTY"}},
@@ -114,6 +116,7 @@ func TestConfigurationErrorsCanBeReferenced(t *testing.T) {
 		{[]string{"-destination", ""}, ErrUnsupportedDestination},
 		{[]string{"-request-timeout", "-1s"}, ErrNonpositiveLimits},
 		{[]string{"-password", "value", "-password-env", "NAME"}, ErrPasswordSourceConflict},
+		{[]string{"-field", "missing-separator"}, ErrInvalidField},
 	} {
 		args := []string{"-destination", "openobserve", "-endpoint", "http://localhost:5080", "-journal-dir", t.TempDir()}
 		_, err := parseConfig(append(args, test.args...), io.Discard)
@@ -124,6 +127,49 @@ func TestConfigurationErrorsCanBeReferenced(t *testing.T) {
 	_, err := (commandConfig{headers: repeatedFlag{"missing-separator"}}).openObserve()
 	if !errors.Is(err, ErrInvalidHeader) {
 		t.Fatalf("header error = %v, want %v", err, ErrInvalidHeader)
+	}
+}
+
+func TestRunAddsConfiguredFields(t *testing.T) {
+	requireJournalPlatform(t)
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var records []struct {
+			Project string      `json:"project"`
+			Version string      `json:"version"`
+			Empty   string      `json:"empty"`
+			Number  json.Number `json:"n"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&records); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(records) != 1 {
+			t.Errorf("received %d records, want 1", len(records))
+		} else if got := records[0]; got.Project != "example=service" || got.Version != "v1'\"雪" || got.Empty != "" || got.Number != "9007199254740993" {
+			t.Errorf("unexpected enriched record: %+v", got)
+		}
+		if _, err := fmt.Fprintf(w, `{"code":200,"status":[{"successful":%d,"failed":0}]}`, len(records)); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	args := []string{
+		"-destination", "openobserve", "-endpoint", server.URL, "-journal-dir", t.TempDir(),
+		"-field", "project=old", "-field", "project=example=service",
+		"-field", "version=v1'\"雪", "-field", "empty=",
+	}
+	input := io.NopCloser(strings.NewReader(`{"project":"from application","version":"stale","empty":"replaced","n":9007199254740993}`))
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if code := run(ctx, args, input, &stdout, &stderr); code != 0 {
+		t.Fatalf("run returned %d: %s", code, stderr.String())
+	}
+	if calls.Load() != 1 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("calls=%d, stdout=%q, stderr=%q", calls.Load(), stdout.String(), stderr.String())
 	}
 }
 

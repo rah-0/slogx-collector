@@ -22,6 +22,7 @@ import (
 )
 
 type commandConfig struct {
+	check           bool
 	input           string
 	destination     string
 	endpoint        string
@@ -31,6 +32,7 @@ type commandConfig struct {
 	passwordFile    string
 	headers         repeatedFlag
 	headerEnv       repeatedFlag
+	fields          repeatedFlag
 	requestTimeout  time.Duration
 	timestampField  string
 	timestampLayout string
@@ -66,6 +68,9 @@ func run(ctx context.Context, args []string, input io.ReadCloser, stdout, stderr
 		fmt.Fprintln(stderr, "slogx-collector:", err)
 		return 2
 	}
+	if cfg.check {
+		return 0
+	}
 	target := sha256.Sum256([]byte("openobserve:" + cfg.endpoint))
 	cfg.options.JournalKey = hex.EncodeToString(target[:])
 	cfg.options.OnRetry = func(err error, delay time.Duration) {
@@ -85,6 +90,7 @@ func parseConfig(args []string, stdout io.Writer) (commandConfig, error) {
 	// private so misspelled options and invalid secret values cannot be logged.
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {}
+	flags.BoolVar(&cfg.check, "check", false, "Validate configuration and credential sources, then exit without reading input, opening the journal, or contacting the destination")
 	flags.StringVar(&cfg.input, "input", "stdin", "Input source (stdin)")
 	flags.StringVar(&cfg.destination, "destination", "", "Destination type (required: openobserve)")
 	flags.StringVar(&cfg.endpoint, "endpoint", "", "Complete OpenObserve JSON ingestion URL (required)")
@@ -95,6 +101,7 @@ func parseConfig(args []string, stdout io.Writer) (commandConfig, error) {
 	flags.StringVar(&cfg.passwordFile, "password-file", "", "File containing the HTTP Basic password (trailing line endings removed)")
 	flags.Var(&cfg.headers, "header", "Additional HTTP header as Name=Value; repeatable")
 	flags.Var(&cfg.headerEnv, "header-env", "HTTP header as Name=ENV, reading its value from ENV; repeatable")
+	flags.Var(&cfg.fields, "field", "String field as Name=Value added before journaling; overrides input; repeatable")
 	flags.StringVar(&cfg.timestampField, "timestamp-field", "time", "Source field copied to _timestamp; empty disables mapping")
 	flags.StringVar(&cfg.timestampLayout, "timestamp-layout", "", "Go layout for string timestamps (default: RFC3339Nano or slogx UTC layout)")
 	flags.DurationVar(&cfg.requestTimeout, "request-timeout", 10*time.Second, "Timeout for each HTTP request")
@@ -152,6 +159,16 @@ func parseConfig(args []string, stdout io.Writer) (commandConfig, error) {
 	}
 	if emptyPasswordSource {
 		return cfg, ErrEmptyPasswordSource
+	}
+	for _, field := range cfg.fields {
+		name, value, ok := strings.Cut(field, "=")
+		if !ok || name == "" {
+			return cfg, ErrInvalidField
+		}
+		if cfg.options.Fields == nil {
+			cfg.options.Fields = make(map[string]string)
+		}
+		cfg.options.Fields[name] = value
 	}
 	return cfg, nil
 }

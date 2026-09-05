@@ -47,6 +47,28 @@ Use a dedicated journal directory for each collector and destination. It is crea
 needed, locked while running, and bound to the destination URL. Reusing it for another URL
 fails before sending its backlog. Preserve the directory across restarts.
 
+## Checking configuration
+
+Add `-check` to the normal collector arguments for a preflight check:
+
+```sh
+slogx-collector -check \
+  -destination openobserve \
+  -endpoint https://logs.example.com/api/default/application/_json \
+  -journal-dir /var/lib/slogx-collector/application \
+  -username ingest@example.com -password-env LOG_INGEST_PASSWORD
+```
+
+This validates all configuration, including required flags and selected credential sources.
+It reads configured password files and environment variables, then exits without reading
+stdin, creating or opening journal files, or contacting the destination. Successful checks
+are silent and return `0`; invalid configuration returns `2` with a diagnostic on stderr.
+Credential values are not printed.
+
+The check does not verify remote authentication or availability, journal contents, locking,
+or filesystem permissions. It can run while another collector owns the journal. Supply the
+same `-journal-dir` and other arguments intended for collection; required flags still apply.
+
 ## Input contract
 
 Each nonblank physical line must contain one JSON object. A final object without a newline
@@ -55,8 +77,9 @@ There is no configured record-size limit. Diagnostics identify the line without 
 its contents.
 
 Objects can use any field names and types; slog's `time`, `level`, and `msg` fields are not
-required. Raw JSON preserves integer precision, nested values, field order, and duplicate
-keys through collection. A destination can transform fields or impose its own restrictions.
+required. Without configured static fields, raw JSON preserves integer precision, nested
+values, field order, and duplicate keys through collection. A destination can transform
+fields or impose its own restrictions.
 
 Only `-input stdin` is implemented. Shell redirection also reads a finite JSON file:
 
@@ -73,6 +96,32 @@ any collection error and remain identifiable with `errors.Is`.
 
 All bytes sent to this input must satisfy the JSON contract. Merge stderr into the pipe only
 if it also contains JSON objects; ordinary panic stacks and plain-text output are invalid input.
+
+## Static fields
+
+Use repeatable `-field Name=Value` flags to attach deployment or source metadata:
+
+```sh
+./my-service | slogx-collector \
+  -destination openobserve \
+  -endpoint https://logs.example.com/api/default/application/_json \
+  -journal-dir /var/lib/slogx-collector/application \
+  -username ingest@example.com -password-env LOG_INGEST_PASSWORD \
+  -field organization=example -field project=application -field version=v1.2.3
+```
+
+Values are strings; empty values and additional `=` characters are preserved. Field names
+are literal top-level keys, and the last flag for a repeated name wins. Configured fields
+replace same-named input fields. With static fields enabled, objects are decoded and
+re-encoded using standard `encoding/json`: top-level duplicate keys resolve to their last
+value and field order or whitespace can change. Unrelated number values retain their exact
+precision.
+
+Fields are added **before journaling**, only to new input. Replaying a backlog preserves
+the metadata originally stored with each record, even when a new process supplies different
+fields. Existing unlabelled journal records remain unlabelled. Programmatic callers use
+`collector.Options.Fields`, a `map[string]string` copied when `Run` starts; metadata is
+independent of the destination.
 
 ## Buffering and delivery
 
@@ -137,6 +186,7 @@ directly rather than the CLI.
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
+| `-check` | `false` | Validate configuration and credential sources, then exit without reading input, opening the journal, or contacting the destination. |
 | `-input` | `stdin` | Input mode; stdin is currently the only implementation. |
 | `-destination` | Required | Destination type; currently `openobserve`. |
 | `-endpoint` | Required | Complete destination ingestion URL. |
@@ -147,6 +197,7 @@ directly rather than the CLI.
 | `-password-file` | Empty | Password file; trailing CR/LF removed. |
 | `-header` | None | Repeatable `Name=Value` HTTP header. |
 | `-header-env` | None | Repeatable `Name=ENV` header read from the named variable. |
+| `-field` | None | Repeatable `Name=Value` string field applied before journaling; overrides input. |
 | `-timestamp-field` | `time` | Field to copy to `_timestamp`; empty disables mapping. |
 | `-timestamp-layout` | Automatic | Go layout for timestamp strings. |
 | `-request-timeout` | `10s` | Timeout per HTTP attempt, including response reading. |
@@ -163,7 +214,7 @@ an `Authorization` header. Batch sizes, intervals, and timeouts must be positive
 
 HTTP uses Go's standard proxy environment variables and system certificate trust.
 
-Exit status is `0` after a complete EOF drain or help, `2` for invalid configuration, and `1`
+Exit status is `0` after a complete EOF drain, a successful check, or help, `2` for invalid configuration, and `1`
 for runtime errors or interruption, including an interruption whose drain completed.
 Runtime diagnostics go to stderr; stdout is reserved for help output.
 

@@ -43,6 +43,15 @@ Configuration uses CLI flags. Keep a dedicated journal directory for each collec
 destination, and preserve it across restarts. The journal has no configured disk quota;
 intake continues during destination outages.
 
+Add source metadata with repeatable `-field Name=Value` flags, such as
+`-field project=application -field version=v1.2.3`. Fields override matching input keys
+before journaling, so backlog replay retains the original values across deployments.
+
+Add `-check` to validate the same configuration and credential sources without reading
+stdin, opening the journal, or contacting the destination. It exits silently with status
+`0` on success or reports a configuration error with status `2`. It does not verify remote
+authentication or journal health.
+
 See the [collector guide](collector/README.md) for all flags, input and delivery contracts,
 OpenObserve timestamp settings, and implementing destinations. Run `slogx-collector -help`
 for the CLI reference.

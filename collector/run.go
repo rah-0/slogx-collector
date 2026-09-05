@@ -18,6 +18,10 @@ type Options struct {
 	JournalDir string
 	// JournalKey optionally binds the journal to a destination identity.
 	JournalKey string
+	// Fields adds string fields to new records, replacing matching input keys.
+	// Fields are captured once per Run and persisted with the record; replayed
+	// records retain their original fields. An empty map leaves records unchanged.
+	Fields map[string]string
 	// BatchSize defaults to 500 records.
 	BatchSize int
 	// BatchBytes defaults to 4 MiB of raw JSON, excluding transport framing.
@@ -104,6 +108,10 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	fields, err := encodeFields(options.Fields)
+	if err != nil {
+		return err
+	}
 	journal, err := openJournal(options.JournalDir, options.JournalKey)
 	if err != nil {
 		return err
@@ -115,7 +123,7 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 	// Receiving the result also marks EOF for delivery; nil disables the case.
 	producerDone := make(chan error, 1)
 	go func(done chan<- error) {
-		err := ingest(workCtx, input, journal)
+		err := ingest(workCtx, input, journal, fields)
 		if err != nil {
 			cancel()
 		}
@@ -235,7 +243,7 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 	return err
 }
 
-func ingest(ctx context.Context, input io.Reader, journal *journal) error {
+func ingest(ctx context.Context, input io.Reader, journal *journal, fields map[string]json.RawMessage) error {
 	reader := newObjectReader(input)
 	for ctx.Err() == nil {
 		record, err := reader.next()
@@ -244,6 +252,12 @@ func ingest(ctx context.Context, input io.Reader, journal *journal) error {
 		}
 		if err != nil {
 			return err
+		}
+		if len(fields) != 0 {
+			record, err = addFields(record, fields)
+			if err != nil {
+				return err
+			}
 		}
 		if err := journal.append(record); err != nil {
 			return &terminalError{err}

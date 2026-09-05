@@ -16,10 +16,11 @@ var (
 	ErrDestinationRequired     = errors.New("collector: destination is required")
 )
 
-// Input errors are wrapped with the input line number.
+// Input and record processing errors.
 var (
 	ErrInvalidJSONRecord = errors.New("record must contain one complete JSON object")
 	ErrInputRead         = errors.New("input read failure")
+	ErrRecordFields      = errors.New("collector: encode record fields")
 )
 
 // Journal validation and integrity errors.
