@@ -9,7 +9,8 @@ standard library and do not need Docker.
 From the repository root:
 
 ```sh
-go test -run '^$' -bench . -benchmem ./collector/...
+go test -run '^$' -bench . -benchmem \
+  ./internal/collector/... ./internal/journal ./internal/jsonx
 ```
 
 Journal benchmarks use `testing.B.TempDir`, which follows `TMPDIR` on Unix. Choose
@@ -20,7 +21,8 @@ On Linux, for example:
 bench_tmp=$(mktemp -d /var/tmp/slogx-collector-bench.XXXXXX)
 TMPDIR="$bench_tmp" GOWORK=off GOGC=100 GOMEMLIMIT=off \
   taskset -c 0 go test -p=1 -run '^$' -bench . -benchmem \
-  -benchtime=1s -count=5 -cpu=1 ./collector/...
+  -benchtime=1s -count=5 -cpu=1 \
+  ./internal/collector/... ./internal/journal ./internal/jsonx
 rmdir "$bench_tmp"
 ```
 
@@ -54,9 +56,9 @@ can have different costs. `B/op` is total heap allocation, not peak memory use.
 
 Measured on 2026-09-05 with Go 1.27.1, linux/amd64, on an AMD Ryzen AI 9 HX 370.
 The journal directory was on ext4 backed by a Samsung SSD 990 PRO 2TB. The run
-used Linux 6.12.105, CPU 0, `GOMAXPROCS=1`, `GOGC=100`, no memory limit, and no
-Go experiments. Other tests and benchmark processes were not run concurrently;
-this was a development machine, not an isolated performance host.
+used Linux 6.12.105, CPU 0, `GOMAXPROCS=1`, `GOGC=100`, no memory limit, and the
+toolchain's default experiment settings. Other tests and benchmark processes were
+not run concurrently; this was a development machine, not an isolated performance host.
 
 Figures below are medians of five one-second samples from one complete run.
 Slow disk operations can exceed the requested sample duration. Latency ranges

@@ -3,6 +3,7 @@ module github.com/rah-0/slogx-collector/integration
 go 1.27.1
 
 require (
+	github.com/rah-0/slogx v0.3.0
 	github.com/rah-0/slogx-collector v0.0.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 )

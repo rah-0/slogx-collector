@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rah-0/slogx-collector/collector"
-	"github.com/rah-0/slogx-collector/collector/openobserve"
+	"github.com/rah-0/slogx-collector/internal/collector"
+	"github.com/rah-0/slogx-collector/internal/collector/openobserve"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -122,12 +122,22 @@ func (s openObserveServer) destination(t *testing.T, stream string) *openobserve
 // includes the deliberately old record used to exercise partial rejection.
 func (s openObserveServer) hits(t *testing.T, stream string, count int) []json.RawMessage {
 	t.Helper()
+	return s.search(t, "logs", stream, "", count)
+}
+
+func (s openObserveServer) search(t *testing.T, signal, stream, traceID string, count int) []json.RawMessage {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	now := time.Now()
+	query := fmt.Sprintf(`SELECT * FROM "%s"`, stream)
+	if traceID != "" {
+		query += fmt.Sprintf(` WHERE trace_id = '%s'`, traceID)
+	}
+	query += " ORDER BY _timestamp"
 	payload, err := json.Marshal(map[string]any{
 		"query": map[string]any{
-			"sql":        fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _timestamp`, stream),
+			"sql":        query,
 			"start_time": now.Add(-72 * time.Hour).UnixMicro(),
 			"end_time":   now.Add(time.Hour).UnixMicro(),
 			"from":       0,
@@ -141,7 +151,7 @@ func (s openObserveServer) hits(t *testing.T, stream string, count int) []json.R
 	defer ticker.Stop()
 	var last string
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/api/default/_search?type=logs", bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/api/default/_search?type="+signal, bytes.NewReader(payload))
 		if err != nil {
 			t.Fatal(err)
 		}

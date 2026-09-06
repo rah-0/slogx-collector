@@ -1,95 +1,92 @@
 # slogx-collector
 
-`slogx-collector` reads newline-delimited JSON from a pipe, saves records in a durable disk
-journal, and delivers batches to a destination. It retries temporary failures and replays
-pending records after a restart. Delivery is at least once.
+`slogx-collector` reads newline-delimited JSON, syncs records to a disk journal,
+and delivers batches with retries and restart replay. It supports OpenObserve
+JSON logs and OTLP HTTP/JSON traces. Delivery is at least once.
 
-OpenObserve is the first destination. The reusable collector accepts any JSON object and uses
-a small destination interface, so other destinations and stream sources can be added without
-changing journal storage. The executable and library use only the Go standard library and
-have no dependency on `slogx`.
+Applications write JSON to the collector's stdin and do not import its packages.
+Slogx applications can send ordinary logs and completed spans through the same pipe;
+the collector owns conversion and delivery.
 
 ## Installation
 
-Requires Go 1.27.1 or later. The durable journal supports Linux, macOS, FreeBSD, NetBSD,
-OpenBSD, and DragonFly BSD.
-
-Install a published version directly from the module root:
+Requires Go 1.27.1 or later. Durable journaling supports Linux, macOS, FreeBSD,
+NetBSD, OpenBSD, and DragonFly BSD.
 
 ```sh
 go install github.com/rah-0/slogx-collector@latest
 ```
 
-Or install from a local checkout:
+To install this checkout, run `go install .`. For an optional local workspace
+with a sibling slogx checkout, run `go work init . ./integration ../slogx` from
+this directory if no workspace exists. Workspace files are ignored by Git.
 
-```sh
-go install .
-```
+## Quick start
 
-## Usage
-
-Set `LOG_INGEST_PASSWORD` in the launching environment, then pipe JSON logs into the command:
+Set `LOG_INGEST_PASSWORD` in the launching environment, then pipe JSON output:
 
 ```sh
 ./my-service | slogx-collector \
   -destination openobserve \
   -endpoint https://logs.example.com/api/default/application/_json \
   -journal-dir /var/lib/slogx-collector/application \
-  -username ingest@example.com \
-  -password-env LOG_INGEST_PASSWORD
+  -username ingest@example.com -password-env LOG_INGEST_PASSWORD
 ```
 
-Configuration uses CLI flags. Keep a dedicated journal directory for each collector and
-destination, and preserve it across restarts. The journal has no configured disk quota;
-intake continues during destination outages.
+Each nonblank input line must be one JSON object. Use `slogx-collector -help`
+for CLI options or the [collector guide](internal/collector/README.md) for contracts.
 
-Add source metadata with repeatable `-field Name=Value` flags, such as
-`-field project=application -field version=v1.2.3`. Fields override matching input keys
-before journaling, so backlog replay retains the original values across deployments.
+## Examples
 
-Add `-check` to validate the same configuration and credential sources without reading
-stdin, opening the journal, or contacting the destination. It exits silently with status
-`0` on success or reports a configuration error with status `2`. It does not verify remote
-authentication or journal health.
+The [examples directory](examples/README.md) contains runnable scripts and tests
+for each case. The tracing application uses only slogx and the standard library.
 
-See the [collector guide](collector/README.md) for all flags, input and delivery contracts,
-OpenObserve timestamp settings, and implementing destinations. Run `slogx-collector -help`
-for the CLI reference.
+| Example | What it demonstrates |
+| --- | --- |
+| [logs](examples/logs) | Collect generic JSON while preserving nested values and large integers. |
+| [fields](examples/fields) | Add or override deployment metadata before journaling. |
+| [check](examples/check) | Validate configuration and credential sources without collecting. |
+| [traces](examples/traces) | Route logs and three nested spans to separate endpoints. |
+| [otlp](examples/otlp) | Deliver spans to an OTLP endpoint and skip ordinary logs. |
+| [replay](examples/replay) | Retain records through an outage and replay the journal after restart. |
 
-## Packages
+## Traces
 
-- [`collector`](collector/README.md): collection loop, disk journal, and `Destination` interface;
-  import `github.com/rah-0/slogx-collector/collector`.
-- [`collector/openobserve`](collector/openobserve): OpenObserve JSON ingestion adapter;
-  import `github.com/rah-0/slogx-collector/collector/openobserve`.
+OpenObserve is a storage and query backend; OTLP is a telemetry transmission
+protocol. `-destination` selects an output adapter: `openobserve` integrates
+OpenObserve's JSON logs API with optional OTLP trace delivery through
+`-traces-endpoint`; `otlp` sends only traces to any compatible OTLP HTTP/JSON
+endpoint, including OpenObserve, and skips ordinary logs. Without
+`-traces-endpoint`, the `openobserve` adapter sends every record as a log.
+Keep slogx's reserved `span` group at the record root. See the
+[application and pipeline example](examples/traces) and
+[trace delivery contract](internal/collector/otlp/README.md).
+
+## Journal and delivery
+
+Use a dedicated persistent journal for each collector and destination. Durability
+starts after a record is synced; application and pipe buffers are outside that
+guarantee. EOF drains the journal. Pending records survive restarts, and uncertain
+acknowledgments can cause duplicates. There is no configured disk quota.
+See [delivery behavior](internal/collector/README.md#buffering-and-delivery) for
+journal identity, retries, and shutdown details.
 
 ## Testing
 
-Run unit tests from the repository root without Docker:
+Run unit and CLI example tests without Docker:
 
 ```sh
-go test -race ./...
+go test -count=1 -race -cover -covermode=atomic ./...
 ```
 
-The separate integration module uses Testcontainers and requires a running Docker daemon:
-
-```sh
-cd integration
-go test -count=1 -v -timeout=5m ./...
-```
-
-It tests ingestion, queries, authentication, partial rejection, and CLI journal replay against
-a real OpenObserve container. See the [testing guide](collector/README.md#testing) for details.
-
-Benchmarks cover parsing, durable journaling, replay, collection, and OpenObserve
-request preparation. See [benchmark results and commands](BENCHMARKS.md).
-
-## License
-
-Available under the [MIT License](LICENSE).
+Example tests use local HTTP fixtures. The separate [integration suite](internal/collector/README.md#testing)
+uses Docker and a real OpenObserve instance. See [benchmarks](BENCHMARKS.md) for
+performance results and commands.
 
 ## Support
 
 If `slogx-collector` keeps your logs flowing, consider buying me a coffee to support its development.
 
 [![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/default-orange.png)](https://www.buymeacoffee.com/rah.0)
+
+Licensed under the [MIT License](LICENSE).

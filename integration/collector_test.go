@@ -26,7 +26,6 @@ func testCollectorCommand(t *testing.T, server openObserveServer) {
 	defer cancel()
 	binary := filepath.Join(t.TempDir(), "slogx-collector")
 	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "github.com/rah-0/slogx-collector")
-	build.Env = append(os.Environ(), "GOWORK=off")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build collector: %v\n%s", err, output)
 	}
@@ -107,6 +106,7 @@ func testCollectorCommand(t *testing.T, server openObserveServer) {
 			t.Fatalf("replayed record = %+v; expected %+v", got, want)
 		}
 	})
+	t.Run("traces", func(t *testing.T) { testCollectorTraces(t, server, binary) })
 }
 
 type commandRecord struct {

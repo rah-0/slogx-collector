@@ -4,21 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 )
-
-type observedInput struct{ reads atomic.Int64 }
 
 func requireJournalPlatform(t *testing.T) {
 	t.Helper()
@@ -29,265 +25,139 @@ func requireJournalPlatform(t *testing.T) {
 	}
 }
 
-func (r *observedInput) Read([]byte) (int, error) {
-	r.reads.Add(1)
-	return 0, io.EOF
-}
-
-func (*observedInput) Close() error { return nil }
-
-func TestHelpDoesNotReadInputOrExposeArguments(t *testing.T) {
-	input := new(observedInput)
-	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), []string{"-password", "secret-value", "-header", "X-Example=secret-value", "-field", "name=secret-value", "-help"}, input, &stdout, &stderr)
-	if code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), "Usage: slogx-collector") || !strings.Contains(stdout.String(), "-journal-dir") {
-		t.Fatalf("help returned %d; stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
-	}
-	if input.reads.Load() != 0 || strings.Contains(stdout.String(), "secret-value") {
-		t.Fatal("help read input or exposed arguments")
-	}
-}
-
-func TestInvalidConfigurationDoesNotReadInput(t *testing.T) {
-	t.Setenv("SLOGX_COLLECT_TEST_EMPTY", "")
-	for _, test := range []struct {
-		name string
-		args []string
-	}{
-		{name: "unknown flag", args: []string{"-secret-value"}},
-		{name: "invalid number", args: []string{"-batch-size", "secret-value"}},
-		{name: "positional argument", args: []string{"secret-value"}},
-		{name: "unsupported source", args: []string{"-input", "secret-value"}},
-		{name: "unsupported destination", args: []string{"-destination", "secret-value"}},
-		{name: "missing destination", args: []string{"-destination", ""}},
-		{name: "missing endpoint", args: []string{"-endpoint", ""}},
-		{name: "missing journal", args: []string{"-journal-dir", ""}},
-		{name: "embedded credentials", args: []string{"-endpoint", "http://user:secret-value@example.invalid"}},
-		{name: "zero batch size", args: []string{"-batch-size", "0"}},
-		{name: "negative bytes", args: []string{"-batch-bytes", "-1"}},
-		{name: "zero flush", args: []string{"-flush-interval", "0"}},
-		{name: "zero request timeout", args: []string{"-request-timeout", "0"}},
-		{name: "zero shutdown timeout", args: []string{"-shutdown-timeout", "0"}},
-		{name: "negative retries", args: []string{"-max-retries", "-1"}},
-		{name: "decreasing retry delay", args: []string{"-retry-interval", "2s", "-max-retry-interval", "1s"}},
-		{name: "malformed header", args: []string{"-header", "secret-value"}},
-		{name: "malformed field", args: []string{"-field", "secret-value"}},
-		{name: "empty field name", args: []string{"-field", "=secret-value"}},
-		{name: "malformed environment header", args: []string{"-header-env", "secret-value"}},
-		{name: "empty environment header", args: []string{"-header-env", "Authorization=SLOGX_COLLECT_TEST_EMPTY"}},
-		{name: "empty environment password", args: []string{"-password-env", "SLOGX_COLLECT_TEST_EMPTY"}},
-		{name: "empty environment name", args: []string{"-password-env", ""}},
-		{name: "empty password path", args: []string{"-password-file", ""}},
-		{name: "unreadable password file", args: []string{"-password-file", filepath.Join(t.TempDir(), "secret-value")}},
-		{name: "password source conflict", args: []string{"-password", "secret-value", "-password-env", "SLOGX_COLLECT_TEST_EMPTY"}},
-		{name: "empty literal password conflict", args: []string{"-password", "", "-password-file", "secret-value"}},
-		{name: "authentication conflict", args: []string{"-username", "user", "-password", "secret-value", "-header", "Authorization=secret-value"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			journalDir := filepath.Join(t.TempDir(), "journal")
-			args := []string{"-destination", "openobserve", "-endpoint", "http://127.0.0.1:1", "-journal-dir", journalDir}
-			args = append(args, test.args...)
-			input := new(observedInput)
-			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, input, &stdout, &stderr)
-			if code != 2 || stdout.Len() != 0 || stderr.Len() == 0 {
-				t.Fatalf("invalid config returned %d; stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
-			}
-			if input.reads.Load() != 0 {
-				t.Fatal("invalid configuration read stdin")
-			}
-			if strings.Contains(stderr.String(), "secret-value") {
-				t.Fatal("configuration error exposed an argument value")
-			}
-			if _, err := os.Stat(journalDir); !os.IsNotExist(err) {
-				t.Fatalf("invalid configuration touched journal: %v", err)
-			}
-		})
-	}
-}
-
-func TestConfigurationErrorsCanBeReferenced(t *testing.T) {
-	for _, test := range []struct {
-		args []string
-		want error
-	}{
-		{[]string{"-unknown"}, ErrInvalidOptions},
-		{[]string{"-input", "file"}, ErrUnsupportedInput},
-		{[]string{"-destination", ""}, ErrUnsupportedDestination},
-		{[]string{"-request-timeout", "-1s"}, ErrNonpositiveLimits},
-		{[]string{"-password", "value", "-password-env", "NAME"}, ErrPasswordSourceConflict},
-		{[]string{"-field", "missing-separator"}, ErrInvalidField},
-	} {
-		args := []string{"-destination", "openobserve", "-endpoint", "http://localhost:5080", "-journal-dir", t.TempDir()}
-		_, err := parseConfig(append(args, test.args...), io.Discard)
-		if !errors.Is(err, test.want) {
-			t.Fatalf("configuration error = %v, want %v", err, test.want)
-		}
-	}
-	_, err := (commandConfig{headers: repeatedFlag{"missing-separator"}}).openObserve()
-	if !errors.Is(err, ErrInvalidHeader) {
-		t.Fatalf("header error = %v, want %v", err, ErrInvalidHeader)
-	}
-}
-
-func TestRunAddsConfiguredFields(t *testing.T) {
+// This fixture imports only slogx. Its stdout crosses an OS pipe into a separate
+// collector executable before any OTLP encoding or HTTP request takes place.
+func TestApplicationPipeRoutesLogsAndThreeLayerTrace(t *testing.T) {
 	requireJournalPlatform(t)
-	var calls atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		var records []struct {
-			Project string      `json:"project"`
-			Version string      `json:"version"`
-			Empty   string      `json:"empty"`
-			Number  json.Number `json:"n"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&records); err != nil {
-			t.Error(err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if len(records) != 1 {
-			t.Errorf("received %d records, want 1", len(records))
-		} else if got := records[0]; got.Project != "example=service" || got.Version != "v1'\"雪" || got.Empty != "" || got.Number != "9007199254740993" {
-			t.Errorf("unexpected enriched record: %+v", got)
-		}
-		if _, err := fmt.Fprintf(w, `{"code":200,"status":[{"successful":%d,"failed":0}]}`, len(records)); err != nil {
-			t.Error(err)
-		}
-	}))
-	defer server.Close()
-	args := []string{
-		"-destination", "openobserve", "-endpoint", server.URL, "-journal-dir", t.TempDir(),
-		"-field", "project=old", "-field", "project=example=service",
-		"-field", "version=v1'\"雪", "-field", "empty=",
-	}
-	input := io.NopCloser(strings.NewReader(`{"project":"from application","version":"stale","empty":"replaced","n":9007199254740993}`))
-	var stdout, stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
-	if code := run(ctx, args, input, &stdout, &stderr); code != 0 {
-		t.Fatalf("run returned %d: %s", code, stderr.String())
+	dir := t.TempDir()
+	application, binary := filepath.Join(dir, "application"), filepath.Join(dir, "collector")
+	for _, build := range []struct{ output, source string }{{application, "./testdata/traceapp"}, {binary, "."}} {
+		if output, err := exec.CommandContext(ctx, "go", "build", "-o", build.output, build.source).CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", build.source, err, output)
+		}
 	}
-	if calls.Load() != 1 || stdout.Len() != 0 || stderr.Len() != 0 {
-		t.Fatalf("calls=%d, stdout=%q, stderr=%q", calls.Load(), stdout.String(), stderr.String())
-	}
-}
-
-func TestRunDeliversJSON(t *testing.T) {
-	requireJournalPlatform(t)
-	t.Setenv("SLOGX_COLLECT_TEST_PASSWORD", "secret-value")
-	t.Setenv("SLOGX_COLLECT_TEST_HEADER", "header-value")
-	var calls atomic.Int64
+	var mu sync.Mutex
+	var logs []map[string]any
+	var spans []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		user, password, ok := r.BasicAuth()
-		if !ok || user != "writer" || password != "secret-value" || r.Header.Get("X-Token") != "header-value" || r.Header.Get("X-Example") != "one=two" {
-			t.Error("request authentication or headers differ")
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Error(err)
-		}
-		want := `[{"time":"2026-09-05T12:00:00Z","n":9007199254740993,"n":2,"_timestamp":1788609600000000}]`
-		if string(body) != want {
-			t.Errorf("body=%s; want %s", body, want)
-		}
-		fmt.Fprint(w, `{"code":200,"status":[{"name":"logs","successful":1,"failed":0}]}`)
-	}))
-	defer server.Close()
-	args := []string{
-		"-destination", "openobserve", "-endpoint", server.URL + "/api/default/logs/_json", "-journal-dir", t.TempDir(),
-		"-username", "writer", "-password-env", "SLOGX_COLLECT_TEST_PASSWORD",
-		"-header-env", "X-Token=SLOGX_COLLECT_TEST_HEADER", "-header", "X-Example=one=two",
-	}
-	input := io.NopCloser(strings.NewReader("{\"time\":\"2026-09-05T12:00:00Z\",\"n\":9007199254740993,\"n\":2}\n"))
-	var stdout, stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	if code := run(ctx, args, input, &stdout, &stderr); code != 0 {
-		t.Fatalf("run returned %d: %s", code, stderr.String())
-	}
-	if calls.Load() != 1 || stdout.Len() != 0 || stderr.Len() != 0 {
-		t.Fatalf("calls=%d, stdout=%q, stderr=%q", calls.Load(), stdout.String(), stderr.String())
-	}
-}
-
-func TestRunKeepsUndeliveredPrefixAfterMalformedInput(t *testing.T) {
-	requireJournalPlatform(t)
-	var healthy atomic.Bool
-	var accepted atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !healthy.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		var records []json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&records); err != nil {
-			t.Error(err)
-		}
-		for _, record := range records {
-			if string(record) != `{"msg":"pending"}` {
-				t.Errorf("replayed unexpected record %s", record)
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/default/logs/_json":
+			var records []map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&records); err != nil {
+				t.Error(err)
 			}
+			logs = append(logs, records...)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "status": []any{map[string]any{"successful": len(records), "failed": 0}}})
+		case "/api/default/v1/traces":
+			var request struct {
+				Resources []struct {
+					Resource struct {
+						Attributes []any `json:"attributes"`
+					} `json:"resource"`
+					Scopes []struct {
+						Spans []map[string]any `json:"spans"`
+					} `json:"scopeSpans"`
+				} `json:"resourceSpans"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			for _, resource := range request.Resources {
+				if attribute(resource.Resource.Attributes, "service.name")["stringValue"] != "example-service" {
+					t.Error("collector did not supply service resource")
+				}
+				for _, scope := range resource.Scopes {
+					spans = append(spans, scope.Spans...)
+				}
+			}
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
-		accepted.Add(int64(len(records)))
-		fmt.Fprintf(w, `{"code":200,"status":[{"successful":%d,"failed":0}]}`, len(records))
 	}))
 	defer server.Close()
-	args := []string{
-		"-destination", "openobserve", "-endpoint", server.URL, "-journal-dir", t.TempDir(),
-		"-retry-interval", "1ms", "-max-retry-interval", "1ms", "-max-retries", "1", "-shutdown-timeout", "100ms",
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	var stdout, stderr bytes.Buffer
-	input := io.NopCloser(strings.NewReader("{\"msg\":\"pending\"}\nsecret-value\n"))
-	if code := run(ctx, args, input, &stdout, &stderr); code != 1 {
-		t.Fatalf("malformed input returned %d: %s", code, stderr.String())
-	}
-	if strings.Contains(stderr.String(), "secret-value") || stdout.Len() != 0 {
-		t.Fatal("diagnostics exposed input or wrote to stdout")
-	}
-	healthy.Store(true)
-	stderr.Reset()
-	if code := run(ctx, args, io.NopCloser(strings.NewReader("")), &stdout, &stderr); code != 0 {
-		t.Fatalf("journal replay returned %d: %s", code, stderr.String())
-	}
-	if accepted.Load() != 1 {
-		t.Fatalf("accepted %d records after restart; want 1", accepted.Load())
-	}
-}
-
-func TestPasswordFile(t *testing.T) {
-	wantPassword := " " + strings.Repeat("secret-value", 6000) + " "
-	passwordFile := filepath.Join(t.TempDir(), "password")
-	if err := os.WriteFile(passwordFile, []byte(wantPassword+"\r\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, password, ok := r.BasicAuth()
-		if !ok || password != wantPassword {
-			t.Error("password file did not preserve spaces and remove line endings")
-		}
-		fmt.Fprint(w, `{"code":200,"status":[{"successful":1,"failed":0}]}`)
-	}))
-	defer server.Close()
-	cfg := commandConfig{endpoint: server.URL, username: "user", passwordFile: passwordFile}
-	destination, err := cfg.openObserve()
+	collector := exec.CommandContext(ctx, binary,
+		"-destination", "openobserve", "-endpoint", server.URL+"/api/default/logs/_json",
+		"-traces-endpoint", server.URL+"/api/default/v1/traces", "-resource", "service.name=example-service",
+		"-journal-dir", filepath.Join(dir, "journal"), "-flush-interval", "1h")
+	input, err := collector.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := destination.Send(t.Context(), []json.RawMessage{json.RawMessage(`{}`)}); err != nil {
+	var collectorOut, collectorErr, applicationErr bytes.Buffer
+	collector.Stdout, collector.Stderr = &collectorOut, &collectorErr
+	if err := collector.Start(); err != nil {
 		t.Fatal(err)
+	}
+	producer := exec.CommandContext(ctx, application)
+	producer.Stdout, producer.Stderr = input, &applicationErr
+	producerErr := producer.Run()
+	closeErr := input.Close()
+	collectorResult := collector.Wait()
+	if producerErr != nil || closeErr != nil || collectorResult != nil {
+		t.Fatalf("application=%v pipe=%v collector=%v\napplication stderr: %s\ncollector stderr: %s", producerErr, closeErr, collectorResult, &applicationErr, &collectorErr)
+	}
+	if collectorOut.Len() != 0 || collectorErr.Len() != 0 || applicationErr.Len() != 0 {
+		t.Fatal("unexpected process output")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logs) != 4 || len(spans) != 3 {
+		t.Fatalf("logs=%d spans=%d; want 4 logs and 3 spans", len(logs), len(spans))
+	}
+	byName := make(map[string]map[string]any)
+	for _, span := range spans {
+		byName[span["name"].(string)] = span
+		attrs := span["attributes"].([]any)
+		if attribute(attrs, "request_id")["stringValue"] != "example-request" {
+			t.Error("span lost context attributes")
+		}
+		source := attribute(attrs, "source")["kvlistValue"].(map[string]any)["values"].([]any)
+		if !strings.HasSuffix(attribute(source, "file")["stringValue"].(string), "traceapp/main.go") {
+			t.Error("span lost caller source")
+		}
+		if len(span["events"].([]any)) != 1 {
+			t.Error("span lost error event")
+		}
+	}
+	root, middle, leaf := byName["handle request"], byName["load item"], byName["query item"]
+	if root["traceId"] != middle["traceId"] || root["traceId"] != leaf["traceId"] || middle["parentSpanId"] != root["spanId"] || leaf["parentSpanId"] != middle["spanId"] {
+		t.Fatal("collector lost three-layer trace relationships")
+	}
+	if attribute(leaf["attributes"].([]any), "item_id")["intValue"] != "9007199254740993" {
+		t.Fatal("collector rounded a large integer")
+	}
+	event := root["events"].([]any)[0].(map[string]any)
+	cause := attribute(event["attributes"].([]any), "err")
+	for _, name := range []string{"handle request", "load item", "query item"} {
+		fields := cause["kvlistValue"].(map[string]any)["values"].([]any)
+		if attribute(fields, "msg")["stringValue"] != name {
+			t.Fatalf("wrapped error lost layer %q", name)
+		}
+		cause = attribute(fields, "cause")
+	}
+	if cause["stringValue"] != "connection refused" {
+		t.Fatal("wrapped error lost original cause")
+	}
+	for _, record := range logs {
+		if _, found := record["span"]; found {
+			t.Error("span was delivered as an ordinary log")
+		}
 	}
 }
 
-func TestCanceledRunIsNonzero(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	args := []string{"-destination", "openobserve", "-endpoint", "http://127.0.0.1:1", "-journal-dir", t.TempDir()}
-	var stdout, stderr bytes.Buffer
-	if code := run(ctx, args, io.NopCloser(strings.NewReader("")), &stdout, &stderr); code != 1 {
-		t.Fatalf("canceled run returned %d; stderr=%s", code, stderr.String())
+func attribute(attrs []any, name string) map[string]any {
+	for _, attr := range attrs {
+		entry := attr.(map[string]any)
+		if entry["key"] == name {
+			return entry["value"].(map[string]any)
+		}
 	}
+	return nil
 }

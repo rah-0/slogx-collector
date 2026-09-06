@@ -1,3 +1,5 @@
 .idea/
 tmp/
 /slogx-collector
+/go.work
+/go.work.sum
