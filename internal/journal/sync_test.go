@@ -57,6 +57,7 @@ func TestJournalAckPreservesUnsyncedTail(t *testing.T) {
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
 	}
+	checkpointJournal(t, j)
 	if len(j.segments) != 1 || j.segments[0].id != segmentID {
 		t.Fatalf("ack rotated the segment containing pending records: %+v", j.segments)
 	}

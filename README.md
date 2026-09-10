@@ -68,12 +68,15 @@ Keep slogx's reserved `span` group at the record root. See the
 ## Journal and delivery
 
 Use a dedicated persistent journal for each collector and destination. Records
-are written to the journal and synced together on a fixed one-second cadence;
-segment rotation can sync earlier. Delivery starts only after a successful sync.
+are synced in groups when 500 records or 4 MiB of journal data accumulate, or on
+the one-second timer. Delivery starts only after a successful sync. Successful
+batches are checkpointed together after 16 batches or on the same timer; segments
+are removed only after their acknowledgement checkpoint is durable.
 A crash can lose records written since the last successful sync. Application and
 pipe buffers are also outside the durability guarantee. EOF syncs pending writes
-and drains the journal. Synced, unacknowledged records survive restarts, and
-uncertain acknowledgments can cause duplicates. There is no configured disk quota.
+and drains the journal; shutdown also checkpoints successful deliveries. Synced,
+unacknowledged records survive restarts. A crash can replay all batches since
+the last checkpoint, and uncertain acknowledgments can also cause duplicates. There is no configured disk quota.
 After a complete drain, the same journal can accept new destination or trace
 resource settings. Pending records keep it bound to its previous configuration.
 See [delivery behavior](internal/collector/README.md#buffering-and-delivery) for

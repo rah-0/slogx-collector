@@ -98,10 +98,12 @@ func (o Options) normalized() (Options, error) {
 // batches. Ingestion continues while delivery retries; disk use grows with the
 // undelivered backlog. Memory holds the current input record and delivery batch;
 // the journal also keeps small metadata entries for its disk segments.
-// A successful Send is acknowledged on disk before the next batch is read.
-// Journal writes are synced once per second and before delivery can read them.
+// Journal writes are synced at 500 records, 4 MiB, or the one-second tick before
+// delivery can read them. Successful sends are checkpointed in groups of up to
+// 16 batches or on the one-second tick, including while EOF delivery drains.
 // EOF and cancellation sync pending writes before draining; abrupt termination
-// can lose writes since the last successful sync.
+// can lose writes since the last successful sync. Close checkpoints successful
+// sends; a crash can replay every batch since the last durable checkpoint.
 // Delivery is at least once: retries or a crash before acknowledgement can cause
 // duplicates. An input error allows ShutdownTimeout to drain preceding records.
 // A journal write failure stops collection immediately, preserving the backlog.
@@ -148,10 +150,27 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 		cancel()
 		closeInput() // The deferred call above joins the saved close error.
 	}
+	// Journal maintenance outlives input EOF and caller cancellation so the
+	// shutdown drain can keep checkpointing. A sync failure cancels both paths.
+	journalCtx, stopJournal := context.WithCancelCause(context.WithoutCancel(ctx))
+	journalDone := make(chan error, 1)
+	go func() {
+		err := syncJournal(journalCtx, store)
+		if err != nil {
+			stopJournal(err)
+			stopInput()
+		}
+		journalDone <- err
+	}()
+	defer func() {
+		stopJournal(nil)
+		result = errors.Join(result, <-journalDone)
+	}()
+
 	// Receiving the result also marks EOF for delivery; nil disables the case.
 	producerDone := make(chan error, 1)
 	go func(done chan<- error) {
-		err := ingest(workCtx, input, store, fields, stopInput)
+		err := ingest(workCtx, input, store, fields)
 		if err != nil {
 			cancel()
 		}
@@ -254,7 +273,7 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 		return errors.Join(ctx.Err(), producerErr)
 	}
 	if ctx.Err() != nil || producerErr != nil {
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), options.ShutdownTimeout)
+		shutdownCtx, cancelShutdown := context.WithTimeout(journalCtx, options.ShutdownTimeout)
 		defer cancelShutdown()
 		// A failed send leaves this batch in memory and advances the journal's
 		// read cursor. Flush it before reading any more records during shutdown.

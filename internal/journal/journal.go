@@ -16,6 +16,9 @@ import (
 
 const (
 	journalSegmentBytes        = 16 << 20
+	journalSyncRecords         = 500
+	journalSyncBytes           = 4 << 20
+	journalCheckpointBatches   = 16
 	journalLengthBytes         = 4
 	journalHeaderBytes         = journalLengthBytes + crc32.Size
 	journalExtendedLengthBytes = 8
@@ -36,24 +39,29 @@ type journalSegment struct {
 // not by one entry per record. Only one producer and one consumer are supported.
 // A Journal must be created with Open.
 type Journal struct {
-	mu          sync.Mutex
-	dir         string
-	key         string
-	lock        *os.File
-	writer      *os.File
-	writeAt     int64
-	rollbackErr error
-	reader      *os.File
-	readerID    uint64
-	segments    []journalSegment
-	readID      uint64
-	readAt      int64
-	notify      chan struct{}
-	closed      bool
+	mu             sync.Mutex
+	dir            string
+	key            string
+	lock           *os.File
+	writer         *os.File
+	writeAt        int64
+	pendingRecords int
+	rollbackErr    error
+	reader         *os.File
+	readerID       uint64
+	segments       []journalSegment
+	readID         uint64
+	readAt         int64
+	ackID          uint64
+	ackAt          int64
+	pendingAcks    int
+	notify         chan struct{}
+	closed         bool
 }
 
-// Append stages a record on disk. Sync makes staged records durable and available
-// to Next and Notify. Segment rotation first syncs the previous segment.
+// Append stages a record on disk. A group of 500 records or 4 MiB of framed data
+// is synced before becoming available to Next and Notify. Sync can commit a
+// smaller group. Segment rotation first syncs the previous segment.
 // The caller must supply a complete JSON object.
 func (j *Journal) Append(record json.RawMessage) error {
 	j.mu.Lock()
@@ -92,18 +100,24 @@ func (j *Journal) Append(record json.RawMessage) error {
 		return j.rollbackAppend(journalError("write frame", err))
 	}
 	j.writeAt += int64(headerBytes) + int64(len(record))
+	j.pendingRecords++
+	last = &j.segments[len(j.segments)-1]
+	if j.pendingRecords >= journalSyncRecords || j.writeAt-last.durableSize >= journalSyncBytes {
+		return j.syncLocked()
+	}
 	return nil
 }
 
 // Sync makes all complete staged records durable before publishing them to Next
-// and Notify. With no staged records it does not issue a filesystem sync.
+// and Notify, and checkpoints successful acknowledgements. With no pending
+// records or acknowledgements it does not issue a filesystem sync.
 func (j *Journal) Sync() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
 		return ErrClosed
 	}
-	return j.syncLocked()
+	return errors.Join(j.syncLocked(), j.checkpointLocked())
 }
 
 func (j *Journal) syncLocked() error {
@@ -121,6 +135,7 @@ func (j *Journal) syncLocked() error {
 		return journalError("sync records", err)
 	}
 	last.durableSize = j.writeAt
+	j.pendingRecords = 0
 	// One pending wake-up is enough: the consumer reads until the journal is empty.
 	select {
 	case j.notify <- struct{}{}:
@@ -196,58 +211,94 @@ func (j *Journal) Next(remainingBytes int) (json.RawMessage, error) {
 	}
 }
 
-// Ack syncs a checkpoint for all records read by Next, then removes fully
-// acknowledged segments. Until the checkpoint is persisted, those records replay
-// when the journal is reopened.
+// Ack marks all records read by Next as successfully delivered. Every 16 new
+// acknowledgements it checkpoints their position and reclaims delivered segments.
+// Sync, Checkpoint, and Close also persist pending acknowledgements. Until then,
+// acknowledged records can replay after an abrupt process exit.
 func (j *Journal) Ack() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
 		return ErrClosed
 	}
+	if j.ackID != j.readID || j.ackAt != j.readAt {
+		j.ackID, j.ackAt = j.readID, j.readAt
+		j.pendingAcks++
+	}
+	if j.pendingAcks >= journalCheckpointBatches {
+		return j.checkpointLocked()
+	}
+	return nil
+}
+
+// Checkpoint persists only records marked by Ack, even if Next has since read
+// further records. Fully acknowledged segments are removed after persistence.
+func (j *Journal) Checkpoint() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return ErrClosed
+	}
+	return j.checkpointLocked()
+}
+
+func (j *Journal) checkpointLocked() error {
+	if j.pendingAcks == 0 {
+		return nil
+	}
+	id, offset := j.ackID, j.ackAt
 	// Normalize a fully consumed segment so its disk space can be reclaimed.
 	for {
-		index := j.readID - j.segments[0].id
-		if j.readAt != j.segments[index].durableSize {
+		index := id - j.segments[0].id
+		if offset != j.segments[index].durableSize {
 			break
 		}
 		if index == uint64(len(j.segments)-1) {
 			// The consumer can reach the durable boundary while writes are pending.
-			if j.readAt == 0 || j.writeAt != j.segments[index].durableSize || j.rollbackErr != nil {
+			if offset == 0 || j.writeAt != j.segments[index].durableSize || j.rollbackErr != nil {
 				break
 			}
-			if j.readID == math.MaxUint64 {
+			if id == math.MaxUint64 {
 				return ErrSequenceExhausted
 			}
-			if err := j.createSegment(j.readID + 1); err != nil {
+			if err := j.createSegment(id + 1); err != nil {
 				return err
 			}
 		}
-		j.readID++
-		j.readAt = 0
+		id++
+		offset = 0
 	}
-	if err := j.saveState(journalState{Version: journalCheckpointVersion, Key: j.key, Segment: j.readID, Offset: j.readAt}); err != nil {
+	if err := j.saveState(journalState{Version: journalCheckpointVersion, Key: j.key, Segment: id, Offset: offset}); err != nil {
 		return err
 	}
-	if j.reader != nil && j.readerID < j.readID {
+	if j.readID == j.ackID && j.readAt == j.ackAt {
+		j.readID, j.readAt = id, offset
+	}
+	j.ackID, j.ackAt = id, offset
+	if j.reader != nil && j.readerID < id {
 		if err := j.reader.Close(); err != nil {
 			return journalError("close acknowledged segment", err)
 		}
 		j.reader = nil
 	}
-	return j.removeBefore(j.readID)
+	if err := j.removeBefore(id); err != nil {
+		return err
+	}
+	j.pendingAcks = 0
+	return nil
 }
 
-// Close syncs staged records, closes the journal files, and releases its lock
-// without acknowledging unread or unacknowledged records. Calling Close more
-// than once is safe. Files and the lock are closed even if the final sync fails.
+// Close syncs staged records and pending acknowledgements, closes the journal
+// files, and releases its lock without acknowledging any further reads.
+// Calling Close more than once is safe. Files and the lock are closed even if
+// the final sync or checkpoint fails.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
 		return nil
 	}
-	err := j.syncLocked()
+	err := errors.Join(j.syncLocked(), j.checkpointLocked())
 	j.closed = true
 	for _, file := range []*os.File{j.reader, j.writer, j.lock} {
 		if file != nil {

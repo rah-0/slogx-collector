@@ -13,35 +13,30 @@ import (
 
 const journalSyncInterval = time.Second
 
-// ingest syncs journal writes while readInput runs independently of the timer.
-// stopInput cancels collection and unblocks the reader if syncing fails.
-func ingest(ctx context.Context, input io.Reader, store *journal.Journal, fields map[string]json.RawMessage, stopInput func()) error {
-	readDone := make(chan error, 1)
-	go func() { readDone <- readInput(ctx, input, store, fields) }()
-
-	ticker := time.NewTicker(journalSyncInterval)
-	defer ticker.Stop()
-	var err error
-	for {
-		select {
-		case err = <-readDone:
-		case <-ticker.C:
-			syncErr := store.Sync()
-			if syncErr == nil {
-				continue
-			}
-			stopInput()
-			err = errors.Join(&terminalError{syncErr}, <-readDone)
-		}
-		break
-	}
-
-	// The reader has stopped. Commit its last complete records before Run can
-	// observe EOF or begin its shutdown drain, preserving any earlier sync error.
+// ingest commits the last complete records before reporting EOF or a read error.
+func ingest(ctx context.Context, input io.Reader, store *journal.Journal, fields map[string]json.RawMessage) error {
+	err := readInput(ctx, input, store, fields)
 	if syncErr := store.Sync(); syncErr != nil {
 		err = errors.Join(err, &terminalError{syncErr})
 	}
 	return err
+}
+
+// syncJournal bounds the wait for partial write groups and acknowledgements.
+// It remains active while ingestion, delivery, or the shutdown drain is running.
+func syncJournal(ctx context.Context, store *journal.Journal) error {
+	ticker := time.NewTicker(journalSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := store.Sync(); err != nil {
+				return &terminalError{err}
+			}
+		}
+	}
 }
 
 func readInput(ctx context.Context, input io.Reader, store *journal.Journal, fields map[string]json.RawMessage) error {

@@ -36,7 +36,7 @@ memory-backed temporary filesystem measures a different workload.
 | Benchmark | One operation | Scope |
 | --- | --- | --- |
 | `ObjectReader` | One JSON record | Steady input framing and validation from memory; includes line-ending bytes in throughput. |
-| `JournalAppend` | 100 records | Disk writes and one sync per record; replay and acknowledgment cleanup are untimed. |
+| `JournalAppend` | 100 records | Disk writes and one group sync per operation; replay and acknowledgment cleanup are untimed. |
 | `JournalReplay` | 500 records | Reopen, active-segment recovery, checksum/JSON validation, and close; fixture writes are untimed. |
 | `Run` | 100 or 500 records | Complete collection and drain, including durable writes and checkpoints, into an in-memory destination. |
 | `MapTimestamp` | One 256-byte record | Validation, field scanning, timestamp parsing, and insertion when enabled. |
@@ -52,7 +52,7 @@ Its throughput measures client work, not the capacity of an OpenObserve server.
 The parser's larger records mostly contain string padding; other JSON shapes
 can have different costs. `B/op` is total heap allocation, not peak memory use.
 
-## Measurements
+## Historical measurements
 
 Measured on 2026-09-05 with Go 1.27.1, linux/amd64, on an AMD Ryzen AI 9 HX 370.
 The journal directory was on ext4 backed by a Samsung SSD 990 PRO 2TB. The run
@@ -64,7 +64,8 @@ Figures below are medians of five one-second samples from one complete run.
 Slow disk operations can exceed the requested sample duration. Latency ranges
 show the minimum and maximum sample, not individual-record tail latency.
 The `Run` and journal figures precede the coordination and journal readability
-refactors and serve as their baseline.
+refactors and the group-commit implementation. They describe the earlier
+per-record-sync implementation, not current collector performance.
 
 ### Input parsing
 
@@ -99,10 +100,9 @@ time is roughly 6–7 ms per record. Disk samples vary enough that these results
 do not establish a benefit from reducing the delivery batch size. Delivery
 batching does not remove the per-record journal sync.
 
-Grouping journal writes before syncing could improve intake, provided records
-only become available for delivery after their group's sync succeeds. That
-requires a deliberate choice about buffering and flush latency; these
-benchmarks leave the existing durability behavior unchanged.
+The collector now groups journal writes before syncing and groups acknowledgement
+checkpoints. The measurements above retain the original per-record-sync baseline;
+they do not measure the current commit policy.
 
 ### Recovery improvement experiment
 

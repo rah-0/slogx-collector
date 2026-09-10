@@ -75,7 +75,7 @@ func Open(dir, key string) (_ *Journal, err error) {
 	return j, nil
 }
 
-// Ack normalizes a drained journal to offset zero in its final empty segment.
+// Checkpoint normalizes a drained journal to offset zero in its final empty segment.
 // Require that durable state before recovery can alter any files for a new key;
 // an in-memory read cursor or an empty newer segment cannot prove delivery.
 func (j *Journal) canRebind(state journalState) bool {
@@ -122,6 +122,7 @@ func (j *Journal) loadSegments() error {
 
 func (j *Journal) restoreSegments(state journalState) error {
 	j.readID, j.readAt = state.Segment, state.Offset
+	j.ackID, j.ackAt = state.Segment, state.Offset
 	if len(j.segments) == 0 {
 		if state.Offset != 0 || state.Segment != journalFirstSegmentID {
 			return ErrCheckpointReferenceMissing

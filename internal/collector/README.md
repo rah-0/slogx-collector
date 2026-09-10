@@ -151,9 +151,11 @@ so an existing backlog cannot be replayed under a different resource configurati
 
 ## Buffering and delivery
 
-- Records are appended to journal files and synced together on a fixed one-second cadence.
-  Only successfully synced records become available for delivery. Syncing continues while
-  stdin is idle or delivery retries; segment rotation can sync pending records earlier.
+- Records are appended to journal files and synced together when 500 records or 4 MiB
+  of journal data accumulate, or on the one-second timer. The byte threshold includes
+  frame headers; a larger record is synced whole. Only successfully synced records become
+  available for delivery. Syncing continues while stdin is idle, delivery retries, or
+  EOF delivery drains. Segment rotation can sync pending records earlier.
   There is no configured journal quota. Intake continues during destination outages;
   journal write or sync failures stop collection and delivery with a nonzero exit.
 - Delivery uses one batch at a time, in journal order. `-batch-bytes` controls batch grouping;
@@ -162,17 +164,23 @@ so an existing backlog cannot be replayed under a different resource configurati
   The pipe can still block when disk intake is slower than the producer. There is no
   destination-outage policy that deliberately pauses intake. `-flush-interval` controls
   how long a delivery batch accumulates after synced records become available; it does
-  not change the journal's sync cadence.
+  not change the journal's commit thresholds or timer.
 - Temporary errors retry with exponential backoff. A destination's requested minimum delay
   is respected. The default is unlimited retries; `-max-retries` can bound them.
-- Successful delivery advances a synced checkpoint before acknowledged segments are removed.
-  Segments rotate at approximately 16 MiB; a larger record occupies its own segment.
+- Successful delivery advances an in-memory acknowledgement cursor. The journal checkpoints
+  it after 16 successful batches or on the one-second timer, independently of early data
+  commits. It never checkpoints a batch that has only been read or is still being sent.
+  Acknowledged segments are removed only after their checkpoint is durable. Segments rotate
+  at approximately 16 MiB; a larger record occupies its own segment.
 - Restart replays durable unacknowledged records in order before newly journaled records.
-  Delivery is **at least once**: a lost response or a crash after remote acceptance can cause duplicates.
+  Delivery is **at least once**: a lost response or a crash after remote acceptance can cause
+  duplicates, including every successful batch since the last durable checkpoint.
   No exactly-once guarantee is provided.
 - Clean stdin EOF syncs pending writes and drains the journal before exiting. SIGINT, SIGTERM,
   or malformed input stops intake, syncs pending writes, and allows `-shutdown-timeout` to
-  drain saved records. Synced records still pending remain for the next run. Bytes still
+  drain saved records. Before exit, the journal syncs pending writes and checkpoints
+  successful deliveries, including when another batch failed. Synced records still pending
+  remain for the next run. Bytes still
   in the pipe or reader buffers have not been accepted; stop the producer and let stdin
   reach EOF when a complete drain is required.
 - Permanent destination errors stop the process and preserve the pending batch and backlog.
@@ -262,7 +270,7 @@ The collector limits trace response bodies to 4 MiB after decompression.
 All protocol conversion, HTTP configuration, acknowledgment handling, and retry scheduling
 belong to the collector.
 
-A full acknowledgment advances the journal checkpoint. Partial rejection stops collection and
+A full acknowledgment advances the cursor saved by the grouped journal checkpoint. Partial rejection stops collection and
 retains the whole batch because rejected spans cannot be identified individually; accepted spans
 may be duplicated if that backlog is replayed. A zero-rejection warning is success. A mixed batch
 is acknowledged only after both destinations succeed; if one succeeds before the other fails,

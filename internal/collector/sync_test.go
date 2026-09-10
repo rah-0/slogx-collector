@@ -7,32 +7,27 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/rah-0/slogx-collector/internal/journal"
 )
 
-func TestIngestSyncsEverySecondWithOpenInput(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
+func TestRunSyncsEverySecondWithOpenInput(t *testing.T) {
+	dir := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		reader, writer := io.Pipe()
-		defer reader.Close()
 		defer writer.Close()
 		done := make(chan error, 1)
+		batches := make(chan string, 2)
 		go func() {
-			done <- ingest(t.Context(), reader, store, nil, func() { _ = reader.Close() })
+			done <- Run(t.Context(), reader, destinationFunc(func(_ context.Context, records []json.RawMessage) error {
+				batches <- string(records[0])
+				return nil
+			}), Options{JournalDir: dir, BatchSize: 1})
 		}()
 		for _, want := range []string{`{"group":1}`, `{"group":2}`} {
 			if _, err := io.WriteString(writer, want+"\n"); err != nil {
@@ -41,14 +36,20 @@ func TestIngestSyncsEverySecondWithOpenInput(t *testing.T) {
 			synctest.Wait()
 			time.Sleep(time.Second - time.Nanosecond)
 			synctest.Wait()
-			if record, err := store.Next(0); !errors.Is(err, io.EOF) {
-				t.Fatalf("before sync: Next = %s, %v; want EOF", record, err)
+			select {
+			case record := <-batches:
+				t.Fatalf("record delivered before sync: %s", record)
+			default:
 			}
 			time.Sleep(time.Nanosecond)
 			synctest.Wait()
-			record, err := store.Next(0)
-			if err != nil || string(record) != want {
-				t.Fatalf("after sync: Next = %s, %v; want %s", record, err, want)
+			select {
+			case record := <-batches:
+				if record != want {
+					t.Fatalf("after sync: got %s, want %s", record, want)
+				}
+			default:
+				t.Fatal("record not delivered after sync")
 			}
 		}
 		if err := writer.Close(); err != nil {
@@ -74,6 +75,13 @@ func TestRunEOFSyncsWithoutWaitingForInterval(t *testing.T) {
 		}
 		if elapsed := time.Since(start); elapsed != 0 {
 			t.Fatalf("EOF waited %v; want no timer delay", elapsed)
+		}
+		var replay [][]string
+		if err := Run(t.Context(), io.NopCloser(strings.NewReader("")), captureBatches(&replay), Options{JournalDir: dir}); err != nil {
+			t.Fatal(err)
+		}
+		if len(replay) != 0 {
+			t.Fatalf("clean EOF did not checkpoint delivery: %v", replay)
 		}
 	})
 }
@@ -126,29 +134,120 @@ func TestRunCancellationSyncsPendingRecords(t *testing.T) {
 	}
 }
 
-func TestIngestSyncFailureUnblocksInput(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
+func TestRunCheckpointFailureUnblocksInput(t *testing.T) {
+	dir := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		reader, writer := io.Pipe()
 		defer writer.Close()
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		start := time.Now()
-		err := ingest(ctx, reader, store, nil, func() {
-			cancel()
-			_ = reader.Close()
-		})
-		if _, ok := errors.AsType[*terminalError](err); !ok || !errors.Is(err, journal.ErrClosed) {
-			t.Fatalf("ingest = %v; want terminal journal sync failure", err)
+		done := make(chan error, 1)
+		var batches [][]string
+		go func() {
+			done <- Run(t.Context(), reader, captureBatches(&batches), Options{JournalDir: dir, BatchSize: 1})
+		}()
+		if _, err := io.WriteString(writer, "{\"id\":1}\n"); err != nil {
+			t.Fatal(err)
 		}
-		if elapsed := time.Since(start); elapsed != time.Second {
-			t.Fatalf("sync failure after %v; want first one-second tick", elapsed)
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if len(batches) != 1 {
+			t.Fatalf("batches = %v; want delivered record awaiting checkpoint", batches)
+		}
+		// A directory at the temporary checkpoint path forces the next save to
+		// fail while ingestion is blocked on an open, idle input stream.
+		if err := os.Mkdir(filepath.Join(dir, "state.tmp"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Second)
+		if err := <-done; err == nil {
+			t.Fatal("Run ignored checkpoint failure")
+		} else if _, ok := errors.AsType[*terminalError](err); !ok {
+			t.Fatalf("Run = %v; want terminal journal failure", err)
+		}
+		if _, err := io.WriteString(writer, "{\"id\":2}\n"); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("write after failure = %v; want closed input", err)
+		}
+	})
+}
+
+func TestRunCheckpointsWhileEOFDeliveryIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		blocked := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		failure := errors.New("second batch failed")
+		go func() {
+			calls := 0
+			done <- Run(t.Context(), io.NopCloser(strings.NewReader("{\"id\":1}\n{\"id\":2}\n")), destinationFunc(func(context.Context, []json.RawMessage) error {
+				calls++
+				if calls == 1 {
+					return nil
+				}
+				close(blocked)
+				<-release
+				return failure
+			}), Options{JournalDir: dir, BatchSize: 1})
+		}()
+		<-blocked
+		synctest.Wait()
+		readOffset := func() int64 {
+			t.Helper()
+			data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var state struct{ Offset int64 }
+			if err := json.Unmarshal(data, &state); err != nil {
+				t.Fatal(err)
+			}
+			return state.Offset
+		}
+		if offset := readOffset(); offset != 0 {
+			t.Fatalf("checkpoint advanced before group timer: %d", offset)
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if offset := readOffset(); offset == 0 {
+			t.Fatal("checkpoint timer stopped at input EOF")
+		}
+		close(release)
+		if err := <-done; !errors.Is(err, failure) {
+			t.Fatalf("Run = %v, want second batch failure", err)
+		}
+		var replay [][]string
+		if err := Run(t.Context(), io.NopCloser(strings.NewReader("")), captureBatches(&replay), Options{JournalDir: dir}); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(replay, [][]string{{`{"id":2}`}}) {
+			t.Fatalf("replay = %v; want failed batch only", replay)
+		}
+	})
+}
+
+func TestRunDeliversFullJournalGroupWithoutTimer(t *testing.T) {
+	dir := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer writer.Close()
+		done := make(chan error, 1)
+		var batches [][]string
+		go func() {
+			done <- Run(t.Context(), reader, captureBatches(&batches), Options{JournalDir: dir})
+		}()
+		start := time.Now()
+		if _, err := io.WriteString(writer, strings.Repeat("{\"id\":1}\n", 500)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if len(batches) != 1 || len(batches[0]) != 500 || time.Since(start) != 0 {
+			t.Fatalf("full group waited for timer: batches=%d elapsed=%v", len(batches), time.Since(start))
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
 	})
 }

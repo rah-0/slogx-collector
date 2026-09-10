@@ -707,7 +707,7 @@ func TestIngestJournalFailureIsTerminal(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	err = ingest(t.Context(), strings.NewReader("{}\n"), store, nil, func() {})
+	err = ingest(t.Context(), strings.NewReader("{}\n"), store, nil)
 	if !errors.Is(err, journal.ErrClosed) {
 		t.Fatalf("ingest = %v, want closed journal error", err)
 	}

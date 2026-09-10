@@ -44,6 +44,13 @@ func syncJournal(t *testing.T, j *Journal) {
 	}
 }
 
+func checkpointJournal(t testing.TB, j *Journal) {
+	t.Helper()
+	if err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func nextJournal(t *testing.T, j *Journal, want string) {
 	t.Helper()
 	record, err := j.Next(0)
@@ -73,6 +80,7 @@ func TestJournalReplaysOnlyUnacknowledgedRecords(t *testing.T) {
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
 	}
+	checkpointJournal(t, j)
 	if len(j.segments) != 1 || j.segments[0].durableSize != 0 {
 		t.Fatalf("acknowledged segments were not reclaimed: %+v", j.segments)
 	}
@@ -189,12 +197,12 @@ func TestJournalRotatesAndReclaimsSegments(t *testing.T) {
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
 	}
+	checkpointJournal(t, j)
 	if _, err := os.Stat(filepath.Join(dir, segmentName(firstID))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("acknowledged segment still exists: %v", err)
 	}
-	if _, err := j.Next(0); !errors.Is(err, io.EOF) {
-		t.Fatalf("rotation exposed the new segment's pending record: %v", err)
-	}
+	// The second large record also exceeds the byte threshold and is durable.
+	nextJournal(t, j, record)
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +259,7 @@ func BenchmarkJournalAppend(b *testing.B) {
 				if err := j.Ack(); err != nil {
 					b.Fatal(err)
 				}
+				checkpointJournal(b, j)
 				b.StartTimer()
 			}
 			b.ReportMetric(recordsPerOp, "records/op")
