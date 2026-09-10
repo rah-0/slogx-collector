@@ -99,6 +99,9 @@ func (o Options) normalized() (Options, error) {
 // undelivered backlog. Memory holds the current input record and delivery batch;
 // the journal also keeps small metadata entries for its disk segments.
 // A successful Send is acknowledged on disk before the next batch is read.
+// Journal writes are synced once per second and before delivery can read them.
+// EOF and cancellation sync pending writes before draining; abrupt termination
+// can lose writes since the last successful sync.
 // Delivery is at least once: retries or a crash before acknowledgement can cause
 // duplicates. An input error allows ShutdownTimeout to drain preceding records.
 // A journal write failure stops collection immediately, preserving the backlog.
@@ -141,10 +144,14 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopInput := func() {
+		cancel()
+		closeInput() // The deferred call above joins the saved close error.
+	}
 	// Receiving the result also marks EOF for delivery; nil disables the case.
 	producerDone := make(chan error, 1)
 	go func(done chan<- error) {
-		err := ingest(workCtx, input, store, fields)
+		err := ingest(workCtx, input, store, fields, stopInput)
 		if err != nil {
 			cancel()
 		}
@@ -152,8 +159,7 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 	}(producerDone)
 	var producerErr error
 	stopProducer := func() {
-		cancel()
-		closeInput() // The deferred call above joins the saved close error.
+		stopInput()
 		if producerDone != nil {
 			producerErr = <-producerDone
 			producerDone = nil
@@ -259,29 +265,6 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 		return errors.Join(ctx.Err(), producerErr, drainErr)
 	}
 	return err
-}
-
-func ingest(ctx context.Context, input io.Reader, store *journal.Journal, fields map[string]json.RawMessage) error {
-	reader := jsonx.NewReader(input)
-	for ctx.Err() == nil {
-		record, err := reader.Next()
-		if ctx.Err() != nil || errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if len(fields) != 0 {
-			record, err = jsonx.AddFields(record, fields)
-			if err != nil {
-				return err
-			}
-		}
-		if err := store.Append(record); err != nil {
-			return &terminalError{err}
-		}
-	}
-	return nil
 }
 
 func sendBatch(ctx context.Context, destination Destination, batch []json.RawMessage, options Options) error {

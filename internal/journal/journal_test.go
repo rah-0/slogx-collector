@@ -37,6 +37,13 @@ func appendJournal(t *testing.T, j *Journal, record string) {
 	}
 }
 
+func syncJournal(t *testing.T, j *Journal) {
+	t.Helper()
+	if err := j.Sync(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func nextJournal(t *testing.T, j *Journal, want string) {
 	t.Helper()
 	record, err := j.Next(0)
@@ -51,6 +58,7 @@ func TestJournalReplaysOnlyUnacknowledgedRecords(t *testing.T) {
 	for _, record := range []string{`{"id":1}`, `{"id":2}`, `{"id":3}`} {
 		appendJournal(t, j, record)
 	}
+	syncJournal(t, j)
 	nextJournal(t, j, `{"id":1}`)
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
@@ -65,7 +73,7 @@ func TestJournalReplaysOnlyUnacknowledgedRecords(t *testing.T) {
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
 	}
-	if len(j.segments) != 1 || j.segments[0].size != 0 {
+	if len(j.segments) != 1 || j.segments[0].durableSize != 0 {
 		t.Fatalf("acknowledged segments were not reclaimed: %+v", j.segments)
 	}
 	if err := j.Close(); err != nil {
@@ -76,12 +84,14 @@ func TestJournalReplaysOnlyUnacknowledgedRecords(t *testing.T) {
 		t.Fatalf("acknowledged record replayed: %v", err)
 	}
 	appendJournal(t, j, `{"id":4}`)
+	syncJournal(t, j)
 	nextJournal(t, j, `{"id":4}`)
 }
 
 func TestJournalNextDoesNotAdvanceOnBatchLimit(t *testing.T) {
 	j := testJournal(t, t.TempDir())
 	appendJournal(t, j, `{"id":1}`)
+	syncJournal(t, j)
 	if _, err := j.Next(1); !errors.Is(err, ErrBatchFull) {
 		t.Fatalf("batch limit = %v", err)
 	}
@@ -136,6 +146,7 @@ func TestJournalReplaysExtendedFramesAcrossCheckpoints(t *testing.T) {
 	}
 	j = testJournal(t, dir)
 	appendJournal(t, j, `{"id":3}`)
+	syncJournal(t, j)
 	nextJournal(t, j, `{"id":2}`)
 	nextJournal(t, j, `{"id":3}`)
 }
@@ -181,6 +192,9 @@ func TestJournalRotatesAndReclaimsSegments(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, segmentName(firstID))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("acknowledged segment still exists: %v", err)
 	}
+	if _, err := j.Next(0); !errors.Is(err, io.EOF) {
+		t.Fatalf("rotation exposed the new segment's pending record: %v", err)
+	}
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +211,7 @@ func benchmarkJournalRecord(size int) json.RawMessage {
 	return json.RawMessage(prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix)
 }
 
-// Each operation durably appends 100 records, including one fsync per record.
+// Each operation stages 100 records and makes them durable with one group sync.
 // Untimed replay and acknowledgement reclaim the records after each operation,
 // so a longer benchmark does not accumulate an ever-growing disk backlog.
 func BenchmarkJournalAppend(b *testing.B) {
@@ -222,6 +236,9 @@ func BenchmarkJournalAppend(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
+				if err := j.Sync(); err != nil {
+					b.Fatal(err)
+				}
 				b.StopTimer()
 				for range recordsPerOp {
 					if _, err := j.Next(0); err != nil {
@@ -243,7 +260,7 @@ func BenchmarkJournalAppend(b *testing.B) {
 }
 
 // Each operation reopens and replays the same 500-record backlog, including
-// recovery checksums, per-record checksum/JSON validation, and journal close.
+// recovery checksums and sync, per-record checksum/JSON validation, and journal close.
 // Fixture writes happen before timing; replay does not acknowledge or write.
 // Repeated reads can use the operating system's page cache.
 func BenchmarkJournalReplay(b *testing.B) {

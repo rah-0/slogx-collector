@@ -28,35 +28,41 @@ const (
 )
 
 type journalSegment struct {
-	id   uint64
-	size int64
+	id          uint64
+	durableSize int64 // Durable bytes available to the consumer.
 }
 
 // Journal keeps payloads on disk. Memory grows by one small entry per segment,
 // not by one entry per record. Only one producer and one consumer are supported.
 // A Journal must be created with Open.
 type Journal struct {
-	mu       sync.Mutex
-	dir      string
-	key      string
-	lock     *os.File
-	writer   *os.File
-	reader   *os.File
-	readerID uint64
-	segments []journalSegment
-	readID   uint64
-	readAt   int64
-	notify   chan struct{}
-	closed   bool
+	mu          sync.Mutex
+	dir         string
+	key         string
+	lock        *os.File
+	writer      *os.File
+	writeAt     int64
+	rollbackErr error
+	reader      *os.File
+	readerID    uint64
+	segments    []journalSegment
+	readID      uint64
+	readAt      int64
+	notify      chan struct{}
+	closed      bool
 }
 
-// Append writes and syncs a record before making it available to Next and Notify.
+// Append stages a record on disk. Sync makes staged records durable and available
+// to Next and Notify. Segment rotation first syncs the previous segment.
 // The caller must supply a complete JSON object.
 func (j *Journal) Append(record json.RawMessage) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
 		return ErrClosed
+	}
+	if j.rollbackErr != nil {
+		return j.rollbackErr
 	}
 	if len(record) == 0 {
 		return ErrInvalidRecordSize
@@ -71,25 +77,50 @@ func (j *Journal) Append(record json.RawMessage) error {
 	}
 	binary.LittleEndian.PutUint32(header[journalLengthBytes:journalHeaderBytes], crc32.ChecksumIEEE(record))
 	last := &j.segments[len(j.segments)-1]
-	if last.size > 0 && int64(len(record)) > journalSegmentBytes-last.size-int64(headerBytes) {
+	if j.writeAt > 0 && int64(len(record)) > journalSegmentBytes-j.writeAt-int64(headerBytes) {
 		if last.id == math.MaxUint64 {
 			return ErrSequenceExhausted
 		}
 		if err := j.createSegment(last.id + 1); err != nil {
 			return err
 		}
-		last = &j.segments[len(j.segments)-1]
 	}
-	if _, err := j.writer.WriteAt(header[:headerBytes], last.size); err != nil {
-		return journalError("write frame header", err)
+	if _, err := j.writer.WriteAt(header[:headerBytes], j.writeAt); err != nil {
+		return j.rollbackAppend(journalError("write frame header", err))
 	}
-	if _, err := j.writer.WriteAt(record, last.size+int64(headerBytes)); err != nil {
-		return journalError("write frame", err)
+	if _, err := j.writer.WriteAt(record, j.writeAt+int64(headerBytes)); err != nil {
+		return j.rollbackAppend(journalError("write frame", err))
+	}
+	j.writeAt += int64(headerBytes) + int64(len(record))
+	return nil
+}
+
+// Sync makes all complete staged records durable before publishing them to Next
+// and Notify. With no staged records it does not issue a filesystem sync.
+func (j *Journal) Sync() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return ErrClosed
+	}
+	return j.syncLocked()
+}
+
+func (j *Journal) syncLocked() error {
+	if j.rollbackErr != nil {
+		return j.rollbackErr
+	}
+	if j.writer == nil {
+		return nil
+	}
+	last := &j.segments[len(j.segments)-1]
+	if j.writeAt == last.durableSize {
+		return nil
 	}
 	if err := j.writer.Sync(); err != nil {
-		return journalError("sync frame", err)
+		return journalError("sync records", err)
 	}
-	last.size += int64(headerBytes) + int64(len(record))
+	last.durableSize = j.writeAt
 	// One pending wake-up is enough: the consumer reads until the journal is empty.
 	select {
 	case j.notify <- struct{}{}:
@@ -98,8 +129,16 @@ func (j *Journal) Append(record json.RawMessage) error {
 	return nil
 }
 
+func (j *Journal) rollbackAppend(writeErr error) error {
+	if err := j.writer.Truncate(j.writeAt); err != nil {
+		// Do not append behind an incomplete frame or reclaim its segment.
+		j.rollbackErr = journalError("discard incomplete frame", err)
+	}
+	return errors.Join(writeErr, j.rollbackErr)
+}
+
 // Next reads the next record without acknowledging it. It returns io.EOF when
-// no unread records remain; a later Append can make more records available.
+// no unread durable records remain; a later Sync can make more records available.
 // A positive remainingBytes limits the record size. ErrBatchFull leaves the
 // record unread. A non-positive budget accepts a record of any size.
 func (j *Journal) Next(remainingBytes int) (json.RawMessage, error) {
@@ -111,7 +150,7 @@ func (j *Journal) Next(remainingBytes int) (json.RawMessage, error) {
 	for {
 		index := j.readID - j.segments[0].id
 		segment := j.segments[index]
-		if j.readAt == segment.size {
+		if j.readAt == segment.durableSize {
 			if index == uint64(len(j.segments)-1) {
 				return nil, io.EOF
 			}
@@ -136,7 +175,7 @@ func (j *Journal) Next(remainingBytes int) (json.RawMessage, error) {
 		if err != nil {
 			return nil, journalError("read frame header", err)
 		}
-		if length > segment.size-j.readAt-headerBytes {
+		if length > segment.durableSize-j.readAt-headerBytes {
 			return nil, ErrCorruptFrame
 		}
 		if remainingBytes > 0 && length > int64(remainingBytes) {
@@ -169,11 +208,12 @@ func (j *Journal) Ack() error {
 	// Normalize a fully consumed segment so its disk space can be reclaimed.
 	for {
 		index := j.readID - j.segments[0].id
-		if j.readAt != j.segments[index].size {
+		if j.readAt != j.segments[index].durableSize {
 			break
 		}
 		if index == uint64(len(j.segments)-1) {
-			if j.readAt == 0 {
+			// The consumer can reach the durable boundary while writes are pending.
+			if j.readAt == 0 || j.writeAt != j.segments[index].durableSize || j.rollbackErr != nil {
 				break
 			}
 			if j.readID == math.MaxUint64 {
@@ -198,16 +238,17 @@ func (j *Journal) Ack() error {
 	return j.removeBefore(j.readID)
 }
 
-// Close closes the journal files and releases its lock without acknowledging
-// unread or unacknowledged records. Calling Close more than once is safe.
+// Close syncs staged records, closes the journal files, and releases its lock
+// without acknowledging unread or unacknowledged records. Calling Close more
+// than once is safe. Files and the lock are closed even if the final sync fails.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
 		return nil
 	}
+	err := j.syncLocked()
 	j.closed = true
-	var err error
 	for _, file := range []*os.File{j.reader, j.writer, j.lock} {
 		if file != nil {
 			err = errors.Join(err, file.Close())
@@ -219,8 +260,8 @@ func (j *Journal) Close() error {
 	return nil
 }
 
-// Notify returns a channel signaled after a successful Append. Signals coalesce;
-// the consumer should read until Next returns io.EOF before waiting again.
+// Notify returns a channel signaled when Sync publishes staged records. Signals
+// coalesce; the consumer should read until Next returns io.EOF before waiting again.
 // Opening a journal with a backlog does not signal the channel. Close does not
 // close the channel.
 func (j *Journal) Notify() <-chan struct{} {
@@ -255,6 +296,9 @@ func readJournalHeader(file *os.File, offset int64) (length int64, checksum uint
 }
 
 func (j *Journal) createSegment(id uint64) error {
+	if err := j.syncLocked(); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(filepath.Join(j.dir, segmentName(id)), os.O_CREATE|os.O_EXCL|os.O_RDWR, journalFileMode)
 	if err != nil {
 		return journalError("create segment", err)
@@ -270,6 +314,7 @@ func (j *Journal) createSegment(id uint64) error {
 		}
 	}
 	j.writer = file
+	j.writeAt = 0
 	j.segments = append(j.segments, journalSegment{id: id})
 	return nil
 }

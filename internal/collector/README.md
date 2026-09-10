@@ -151,29 +151,36 @@ so an existing backlog cannot be replayed under a different resource configurati
 
 ## Buffering and delivery
 
-- Each accepted record is appended and synced to disk before becoming available for delivery.
-  There is no configured journal quota. Intake continues during destination outages; actual
-  disk write failures stop collection with a nonzero exit.
+- Records are appended to journal files and synced together on a fixed one-second cadence.
+  Only successfully synced records become available for delivery. Syncing continues while
+  stdin is idle or delivery retries; segment rotation can sync pending records earlier.
+  There is no configured journal quota. Intake continues during destination outages;
+  journal write or sync failures stop collection and delivery with a nonzero exit.
 - Delivery uses one batch at a time, in journal order. `-batch-bytes` controls batch grouping;
   a record larger than that target is sent alone. Memory holds the current input record and
-  delivery batch; the backlog stays on disk, with small metadata per journal segment.
-  Record syncing limits intake throughput, so the pipe can still block when disk intake is
-  slower than the producer. There is no destination-outage policy that deliberately pauses intake.
+  delivery batch; the backlog stays in journal files, with small metadata per segment.
+  The pipe can still block when disk intake is slower than the producer. There is no
+  destination-outage policy that deliberately pauses intake. `-flush-interval` controls
+  how long a delivery batch accumulates after synced records become available; it does
+  not change the journal's sync cadence.
 - Temporary errors retry with exponential backoff. A destination's requested minimum delay
   is respected. The default is unlimited retries; `-max-retries` can bound them.
 - Successful delivery advances a synced checkpoint before acknowledged segments are removed.
   Segments rotate at approximately 16 MiB; a larger record occupies its own segment.
-- Restart replays unacknowledged records in order before newly journaled records. Delivery is
-  **at least once**: a lost response or a crash after remote acceptance can cause duplicates.
+- Restart replays durable unacknowledged records in order before newly journaled records.
+  Delivery is **at least once**: a lost response or a crash after remote acceptance can cause duplicates.
   No exactly-once guarantee is provided.
-- Clean stdin EOF drains the journal before exiting. SIGINT, SIGTERM, or malformed input stops
-  intake and allows `-shutdown-timeout` to drain saved records. Records still pending remain
-  for the next run. Bytes still in the pipe or reader buffers have not been accepted; stop the
-  producer and let stdin reach EOF when a complete drain is required.
+- Clean stdin EOF syncs pending writes and drains the journal before exiting. SIGINT, SIGTERM,
+  or malformed input stops intake, syncs pending writes, and allows `-shutdown-timeout` to
+  drain saved records. Synced records still pending remain for the next run. Bytes still
+  in the pipe or reader buffers have not been accepted; stop the producer and let stdin
+  reach EOF when a complete drain is required.
 - Permanent destination errors stop the process and preserve the pending batch and backlog.
   Correct the configuration or rejected data before restarting. There is no automatic dropping
   or dead-letter policy. Treat journal files as collector-owned state, not editable JSON logs.
 
+A crash can lose records written since the last successful sync. Scheduling delays and slow
+storage can extend the interval between successful syncs.
 The journal checks record checksums and recovers incomplete final writes. Durability assumes
 the local filesystem and storage honor sync operations; copying a journal requires stopping
 its collector first.
@@ -292,7 +299,7 @@ shutdown. See the [trace destination contract](otlp/README.md) for conversion an
 | `-request-timeout` | `10s` | Timeout per HTTP attempt, including response reading. |
 | `-batch-size` | `500` | Maximum input records per batch. |
 | `-batch-bytes` | `4194304` | Target raw JSON bytes per batch; larger records are sent alone. |
-| `-flush-interval` | `1s` | Maximum accumulation time before attempting a partial batch. |
+| `-flush-interval` | `1s` | Maximum accumulation time for a partial delivery batch after records are synced. Does not change journal syncing. |
 | `-retry-interval` | `1s` | Initial retry delay. |
 | `-max-retry-interval` | `30s` | Exponential backoff cap; server Retry-After can exceed it. |
 | `-max-retries` | `0` | Retries after the first attempt; zero means unlimited. |

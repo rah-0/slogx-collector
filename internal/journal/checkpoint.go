@@ -62,7 +62,7 @@ func (j *Journal) validateCursor() error {
 	if segment.id == 0 {
 		return ErrCheckpointSegmentMissing
 	}
-	if j.readAt > segment.size {
+	if j.readAt > segment.durableSize {
 		return ErrCheckpointBeyondEnd
 	}
 	file, err := os.Open(filepath.Join(j.dir, segmentName(segment.id)))
@@ -76,7 +76,7 @@ func (j *Journal) validateCursor() error {
 		if err != nil {
 			return journalError("validate checkpoint frame", err)
 		}
-		if length > segment.size-offset-headerBytes {
+		if length > segment.durableSize-offset-headerBytes {
 			return ErrInvalidCheckpointFrame
 		}
 		offset += headerBytes + length

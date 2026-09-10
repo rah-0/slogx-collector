@@ -19,6 +19,7 @@ func TestJournalOpenRemovesStaleCheckpointAndReplaysBacklog(t *testing.T) {
 	j := testJournal(t, dir)
 	appendJournal(t, j, `{"id":1}`)
 	appendJournal(t, j, `{"id":2}`)
+	syncJournal(t, j)
 	nextJournal(t, j, `{"id":1}`)
 	if err := j.Ack(); err != nil {
 		t.Fatal(err)
@@ -183,6 +184,7 @@ func TestJournalRecoversIncompleteTail(t *testing.T) {
 			}
 			j = testJournal(t, dir)
 			appendJournal(t, j, `{"id":2}`)
+			syncJournal(t, j)
 			nextJournal(t, j, `{"id":1}`)
 			nextJournal(t, j, `{"id":2}`)
 		})
@@ -267,6 +269,7 @@ func TestJournalRebindsDrainedDestination(t *testing.T) {
 			j := testJournal(t, dir)
 			if setup == "acknowledged" {
 				appendJournal(t, j, `{"id":1}`)
+				syncJournal(t, j)
 				nextJournal(t, j, `{"id":1}`)
 				if err := j.Ack(); err != nil {
 					t.Fatal(err)
@@ -323,6 +326,7 @@ func TestJournalRejectsDestinationChangeWithUnacknowledgedRecords(t *testing.T) 
 			j := testJournal(t, dir)
 			appendJournal(t, j, `{"id":1}`)
 			if setup == "read without Ack" {
+				syncJournal(t, j)
 				nextJournal(t, j, `{"id":1}`)
 				if _, err := j.Next(0); !errors.Is(err, io.EOF) {
 					t.Fatalf("after reading = %v, want EOF", err)
@@ -419,17 +423,22 @@ func TestJournalPreservesUnrelatedDirectoryContents(t *testing.T) {
 }
 
 func TestJournalReplayAfterProcessExit(t *testing.T) {
-	dir := t.TempDir()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestJournalCrashHelper$")
-	cmd.Env = append(os.Environ(), "SLOGX_TEST_CRASH_JOURNAL="+dir)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("child failed: %v\n%s", err, output)
-	}
-	j := testJournal(t, dir)
-	nextJournal(t, j, `{"id":1}`)
-	// An interrupted write after a durable record is discarded on recovery.
-	if _, err := j.Next(0); !errors.Is(err, io.EOF) {
-		t.Fatalf("incomplete child write replayed: %v", err)
+	for _, tail := range []string{"complete", "incomplete"} {
+		t.Run(tail, func(t *testing.T) {
+			dir := t.TempDir()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestJournalCrashHelper$")
+			cmd.Env = append(os.Environ(), "SLOGX_TEST_CRASH_JOURNAL="+dir, "SLOGX_TEST_CRASH_TAIL="+tail)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("child failed: %v\n%s", err, output)
+			}
+			j := testJournal(t, dir)
+			nextJournal(t, j, `{"id":1}`)
+			// Complete frames left without a sync are persisted during recovery.
+			nextJournal(t, j, `{"id":2}`)
+			if _, err := j.Next(0); !errors.Is(err, io.EOF) {
+				t.Fatalf("incomplete child write replayed: %v", err)
+			}
+		})
 	}
 }
 
@@ -443,10 +452,14 @@ func TestJournalCrashHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendJournal(t, j, `{"id":1}`)
-	var header [8]byte
-	binary.LittleEndian.PutUint32(header[:4], 123)
-	if _, err := j.writer.WriteAt(header[:], j.segments[0].size); err != nil {
-		t.Fatal(err)
+	syncJournal(t, j)
+	appendJournal(t, j, `{"id":2}`)
+	if os.Getenv("SLOGX_TEST_CRASH_TAIL") == "incomplete" {
+		var header [8]byte
+		binary.LittleEndian.PutUint32(header[:4], 123)
+		if _, err := j.writer.WriteAt(header[:], j.writeAt); err != nil {
+			t.Fatal(err)
+		}
 	}
 	os.Exit(0) // Deliberately bypass Close and testing cleanup.
 }

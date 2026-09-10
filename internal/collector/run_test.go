@@ -293,33 +293,82 @@ func TestRunReplaysFailedDelivery(t *testing.T) {
 }
 
 func TestRunJournalsWhileDeliveryBlocked(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(t.Context())
+	reader, writer := io.Pipe()
 	inputEOF := make(chan struct{})
-	input := &readObserver{ReadCloser: io.NopCloser(strings.NewReader(strings.Repeat("{\"n\":1}\n", 100))), eof: inputEOF}
+	input := &readObserver{ReadCloser: reader, eof: inputEOF}
 	started := make(chan struct{})
 	release := make(chan struct{})
 	result := make(chan error, 1)
 	var batches [][]string
+	t.Cleanup(func() {
+		cancel()
+		_ = writer.Close()
+		_ = reader.Close()
+		select {
+		case <-result:
+		case <-time.After(5 * time.Second):
+			t.Error("collector did not stop during cleanup")
+		}
+	})
 	go func() {
+		defer close(result)
 		first := true
-		result <- Run(t.Context(), input, destinationFunc(func(ctx context.Context, records []json.RawMessage) error {
+		result <- Run(ctx, input, destinationFunc(func(ctx context.Context, records []json.RawMessage) error {
 			if first {
 				first = false
 				close(started)
-				<-release
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 			return captureBatches(&batches).Send(ctx, records)
-		}), Options{JournalDir: t.TempDir(), BatchSize: 1})
+		}), Options{JournalDir: dir, BatchSize: 1})
 	}()
-	<-started
+	writeInput := func(records string) {
+		t.Helper()
+		written := make(chan error, 1)
+		go func() {
+			_, err := io.WriteString(writer, records)
+			written <- err
+		}()
+		select {
+		case err := <-written:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("input ingestion stopped while writing records")
+		}
+	}
+	writeInput("{\"n\":1}\n")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("collector did not start delivering the first record")
+	}
+	// The rest of the input arrives only after Send is blocked. Reaching EOF
+	// here proves intake can continue independently of delivery.
+	writeInput(strings.Repeat("{\"n\":1}\n", 99))
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-inputEOF:
 	case <-time.After(5 * time.Second):
-		close(release)
 		t.Fatal("input ingestion stopped while destination was blocked")
 	}
 	close(release)
-	if err := <-result; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("collector did not drain after releasing the destination")
 	}
 	if len(batches) != 100 {
 		t.Fatalf("delivered batches = %d, want 100", len(batches))
@@ -658,7 +707,7 @@ func TestIngestJournalFailureIsTerminal(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	err = ingest(t.Context(), strings.NewReader("{}\n"), store, nil)
+	err = ingest(t.Context(), strings.NewReader("{}\n"), store, nil, func() {})
 	if !errors.Is(err, journal.ErrClosed) {
 		t.Fatalf("ingest = %v, want closed journal error", err)
 	}

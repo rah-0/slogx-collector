@@ -18,8 +18,9 @@ const (
 )
 
 // Open exclusively locks dir, validates its checkpoint and segment layout,
-// and recovers an incomplete final frame. It creates dir when needed and binds
-// the journal to key until all records have been durably acknowledged.
+// and recovers an incomplete final frame. It syncs recovered complete records
+// before exposing them. It creates dir when needed and binds the journal to key
+// until all records have been durably acknowledged.
 // Records without a durable acknowledgement remain available to Next.
 func Open(dir, key string) (_ *Journal, err error) {
 	if dir == "" {
@@ -85,7 +86,7 @@ func (j *Journal) canRebind(state journalState) bool {
 		return state.Segment == journalFirstSegmentID
 	}
 	last := j.segments[len(j.segments)-1]
-	return state.Segment == last.id && last.size == 0
+	return state.Segment == last.id && last.durableSize == 0
 }
 
 func (j *Journal) loadSegments() error {
@@ -114,7 +115,7 @@ func (j *Journal) loadSegments() error {
 		if err != nil {
 			return journalError("inspect segment", err)
 		}
-		j.segments = append(j.segments, journalSegment{id: id, size: info.Size()})
+		j.segments = append(j.segments, journalSegment{id: id, durableSize: info.Size()})
 	}
 	return nil
 }
@@ -147,8 +148,13 @@ func (j *Journal) restoreSegments(state journalState) error {
 	if err != nil {
 		return journalError("open active segment", err)
 	}
-	last.size, err = recoverSegment(j.writer, last.size)
-	return err
+	j.writeAt = last.durableSize
+	size, err := recoverSegment(j.writer, last.durableSize)
+	if err != nil {
+		return err
+	}
+	last.durableSize, j.writeAt = size, size
+	return nil
 }
 
 // Persist each newly created directory entry in its parent before accepting
@@ -211,9 +217,11 @@ func recoverSegment(file *os.File, size int64) (int64, error) {
 		if err := file.Truncate(offset); err != nil {
 			return 0, journalError("recover incomplete frame", err)
 		}
-		if err := file.Sync(); err != nil {
-			return 0, journalError("sync recovered segment", err)
-		}
+	}
+	// Complete frames can survive a process exit without having been synced.
+	// Persist them before recovery makes them available for delivery.
+	if err := file.Sync(); err != nil {
+		return 0, journalError("sync recovered segment", err)
 	}
 	return offset, nil
 }

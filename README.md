@@ -1,6 +1,6 @@
 # slogx-collector
 
-`slogx-collector` reads newline-delimited JSON, syncs records to a disk journal,
+`slogx-collector` reads newline-delimited JSON, syncs groups of records to a disk journal,
 and delivers batches with retries and restart replay. It supports OpenObserve
 JSON logs and OTLP HTTP/JSON traces. Delivery is at least once.
 
@@ -67,10 +67,13 @@ Keep slogx's reserved `span` group at the record root. See the
 
 ## Journal and delivery
 
-Use a dedicated persistent journal for each collector and destination. Durability
-starts after a record is synced; application and pipe buffers are outside that
-guarantee. EOF drains the journal. Pending records survive restarts, and uncertain
-acknowledgments can cause duplicates. There is no configured disk quota.
+Use a dedicated persistent journal for each collector and destination. Records
+are written to the journal and synced together on a fixed one-second cadence;
+segment rotation can sync earlier. Delivery starts only after a successful sync.
+A crash can lose records written since the last successful sync. Application and
+pipe buffers are also outside the durability guarantee. EOF syncs pending writes
+and drains the journal. Synced, unacknowledged records survive restarts, and
+uncertain acknowledgments can cause duplicates. There is no configured disk quota.
 After a complete drain, the same journal can accept new destination or trace
 resource settings. Pending records keep it bound to its previous configuration.
 See [delivery behavior](internal/collector/README.md#buffering-and-delivery) for
