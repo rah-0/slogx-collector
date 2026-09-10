@@ -19,7 +19,7 @@ const (
 
 // Open exclusively locks dir, validates its checkpoint and segment layout,
 // and recovers an incomplete final frame. It creates dir when needed and binds
-// the journal to key so it cannot be reopened for a different destination.
+// the journal to key until all records have been durably acknowledged.
 // Records without a durable acknowledgement remain available to Next.
 func Open(dir, key string) (_ *Journal, err error) {
 	if dir == "" {
@@ -49,6 +49,9 @@ func Open(dir, key string) (_ *Journal, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if state.Key != key && !j.canRebind(state) {
+		return nil, ErrDestinationMismatch
+	}
 	if err := os.Remove(filepath.Join(dir, journalCheckpointTempName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, journalError("remove incomplete checkpoint", err)
 	}
@@ -58,11 +61,31 @@ func Open(dir, key string) (_ *Journal, err error) {
 	if err := j.validateCursor(); err != nil {
 		return nil, err
 	}
+	if state.Key != key {
+		state.Key = key
+		if err := j.saveState(state); err != nil {
+			return nil, err
+		}
+	}
 	// Validate the checkpoint before removing any files it claims were sent.
 	if err := j.removeBefore(state.Segment); err != nil {
 		return nil, err
 	}
 	return j, nil
+}
+
+// Ack normalizes a drained journal to offset zero in its final empty segment.
+// Require that durable state before recovery can alter any files for a new key;
+// an in-memory read cursor or an empty newer segment cannot prove delivery.
+func (j *Journal) canRebind(state journalState) bool {
+	if state.Offset != 0 {
+		return false
+	}
+	if len(j.segments) == 0 {
+		return state.Segment == journalFirstSegmentID
+	}
+	last := j.segments[len(j.segments)-1]
+	return state.Segment == last.id && last.size == 0
 }
 
 func (j *Journal) loadSegments() error {

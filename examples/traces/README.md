@@ -49,7 +49,8 @@ Durability begins when the collector writes and syncs the journal. Temporary
 outages are retried, and retained records replay after restarts with their
 original IDs, timestamps, and attributes. Mixed delivery is acknowledged only
 after both destinations succeed, so a retry can resend an already accepted
-partition. Reuse the same journal only with the same destination and resources.
+partition. Keep the same destination and resources while records are pending;
+a fully drained journal can adopt new settings after startup validation.
 
 Without `-traces-endpoint`, the OpenObserve destination stores completed spans
 as ordinary logs. For delivery to a generic traces endpoint, see

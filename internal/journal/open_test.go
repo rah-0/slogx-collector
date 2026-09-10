@@ -245,19 +245,151 @@ func TestJournalRejectsCorruptionWithoutDeletingData(t *testing.T) {
 	}
 }
 
-func TestJournalLocksAndBindsDestination(t *testing.T) {
+func TestJournalLocksDestinationChanges(t *testing.T) {
 	dir := t.TempDir()
 	j := testJournal(t, dir)
-	if _, err := Open(dir, "test-destination"); err == nil {
-		t.Fatal("concurrent journal use succeeded")
+	for _, key := range []string{"test-destination", "different-destination"} {
+		if other, err := Open(dir, key); err == nil {
+			_ = other.Close()
+			t.Fatal("concurrent journal use succeeded")
+		}
 	}
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(dir, "different-destination"); err == nil {
-		t.Fatal("journal accepted another destination")
-	}
 	_ = testJournal(t, dir)
+}
+
+func TestJournalRebindsDrainedDestination(t *testing.T) {
+	for _, setup := range []string{"fresh", "acknowledged", "initial checkpoint without segment"} {
+		t.Run(setup, func(t *testing.T) {
+			dir := t.TempDir()
+			j := testJournal(t, dir)
+			if setup == "acknowledged" {
+				appendJournal(t, j, `{"id":1}`)
+				nextJournal(t, j, `{"id":1}`)
+				if err := j.Ack(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if setup == "initial checkpoint without segment" {
+				if err := os.Remove(filepath.Join(dir, segmentName(1))); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			j, err := Open(dir, "different-destination")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := j.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if _, err := j.Next(0); !errors.Is(err, io.EOF) {
+				t.Fatalf("rebound journal = %v, want EOF", err)
+			}
+			appendJournal(t, j, `{"id":2}`)
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// The new key must already be durable before a subsequent Ack.
+			assertJournalOpenError(t, dir, ErrDestinationMismatch)
+			reopened, err := Open(dir, "different-destination")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := reopened.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			nextJournal(t, reopened, `{"id":2}`)
+			if _, err := reopened.Next(0); !errors.Is(err, io.EOF) {
+				t.Fatalf("after rebound backlog = %v, want EOF", err)
+			}
+		})
+	}
+}
+
+func TestJournalRejectsDestinationChangeWithUnacknowledgedRecords(t *testing.T) {
+	for _, setup := range []string{"pending", "read without Ack", "empty newer segment", "incomplete tail"} {
+		t.Run(setup, func(t *testing.T) {
+			dir := t.TempDir()
+			j := testJournal(t, dir)
+			appendJournal(t, j, `{"id":1}`)
+			if setup == "read without Ack" {
+				nextJournal(t, j, `{"id":1}`)
+				if _, err := j.Next(0); !errors.Is(err, io.EOF) {
+					t.Fatalf("after reading = %v, want EOF", err)
+				}
+			}
+			if setup == "empty newer segment" {
+				if err := j.createSegment(2); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string][]byte{"state.tmp": []byte(`{"version":`)}
+			for _, name := range []string{"state.json", segmentName(1)} {
+				data, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				files[name] = data
+			}
+			if setup == "empty newer segment" {
+				files[segmentName(2)] = nil
+			}
+			if setup == "incomplete tail" {
+				files[segmentName(1)] = append(files[segmentName(1)], 3, 0, 0)
+			}
+			writeJournalStartupFiles(t, dir, files)
+
+			other, err := Open(dir, "different-destination")
+			if other != nil {
+				_ = other.Close()
+			}
+			if !errors.Is(err, ErrDestinationMismatch) {
+				t.Fatalf("change destination = %v, want ErrDestinationMismatch", err)
+			}
+			assertJournalStartupFiles(t, dir, files)
+			j = testJournal(t, dir)
+			nextJournal(t, j, `{"id":1}`)
+		})
+	}
+}
+
+func TestJournalDestinationChangePreservesInvalidState(t *testing.T) {
+	frame := extendedJournalFrame(`{"id":1}`)
+	corrupt := bytes.Clone(frame)
+	corrupt[4] ^= 1
+	for name, files := range map[string]map[string][]byte{
+		"invalid checkpoint":   {"state.json": []byte(`{`), segmentName(1): nil},
+		"missing checkpoint":   {segmentName(1): frame},
+		"missing segment":      {"state.json": []byte(`{"version":1,"key":"test-destination","segment":2,"offset":0}`)},
+		"past segment end":     {"state.json": []byte(`{"version":1,"key":"test-destination","segment":1,"offset":1}`), segmentName(1): nil},
+		"gap after checkpoint": {"state.json": []byte(`{"version":1,"key":"test-destination","segment":1,"offset":0}`), segmentName(1): nil, segmentName(3): nil},
+		"corrupt frame":        {"state.json": []byte(`{"version":1,"key":"test-destination","segment":1,"offset":0}`), segmentName(1): corrupt},
+		"incomplete frame":     {"state.json": []byte(`{"version":1,"key":"test-destination","segment":1,"offset":0}`), segmentName(1): frame[:len(frame)-1]},
+		"unrecognized entry":   {"state.json": []byte(`{"version":1,"key":"test-destination","segment":1,"offset":0}`), segmentName(1): nil, "user-file": []byte("keep")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJournalStartupFiles(t, dir, files)
+			if j, err := Open(dir, "different-destination"); err == nil {
+				_ = j.Close()
+				t.Fatal("invalid journal accepted another destination")
+			}
+			assertJournalStartupFiles(t, dir, files)
+		})
+	}
 }
 
 func TestJournalCreatesNestedDirectories(t *testing.T) {

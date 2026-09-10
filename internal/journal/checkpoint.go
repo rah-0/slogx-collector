@@ -48,9 +48,6 @@ func (j *Journal) loadState() (journalState, error) {
 	if state.Version != journalCheckpointVersion || state.Segment == 0 || state.Offset < 0 {
 		return state, ErrInvalidCheckpoint
 	}
-	if state.Key != j.key {
-		return state, ErrDestinationMismatch
-	}
 	return state, nil
 }
 

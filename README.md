@@ -35,6 +35,9 @@ Set `LOG_INGEST_PASSWORD` in the launching environment, then pipe JSON output:
 
 Each nonblank input line must be one JSON object. Use `slogx-collector -help`
 for CLI options or the [collector guide](internal/collector/README.md) for contracts.
+Supervisors can add `-ready` and wait for `ready\n` on stdout before starting the
+producer. This confirms local startup and journal access; see
+[startup readiness](internal/collector/README.md#startup-readiness) for its limits.
 
 ## Examples
 
@@ -68,6 +71,8 @@ Use a dedicated persistent journal for each collector and destination. Durabilit
 starts after a record is synced; application and pipe buffers are outside that
 guarantee. EOF drains the journal. Pending records survive restarts, and uncertain
 acknowledgments can cause duplicates. There is no configured disk quota.
+After a complete drain, the same journal can accept new destination or trace
+resource settings. Pending records keep it bound to its previous configuration.
 See [delivery behavior](internal/collector/README.md#buffering-and-delivery) for
 journal identity, retries, and shutdown details.
 

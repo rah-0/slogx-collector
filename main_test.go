@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -83,6 +84,7 @@ func TestApplicationPipeRoutesLogsAndThreeLayerTrace(t *testing.T) {
 	}))
 	defer server.Close()
 	collector := exec.CommandContext(ctx, binary,
+		"-ready",
 		"-destination", "openobserve", "-endpoint", server.URL+"/api/default/logs/_json",
 		"-traces-endpoint", server.URL+"/api/default/v1/traces", "-resource", "service.name=example-service",
 		"-journal-dir", filepath.Join(dir, "journal"), "-flush-interval", "1h")
@@ -90,20 +92,32 @@ func TestApplicationPipeRoutesLogsAndThreeLayerTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var collectorOut, collectorErr, applicationErr bytes.Buffer
-	collector.Stdout, collector.Stderr = &collectorOut, &collectorErr
+	defer input.Close()
+	output, err := collector.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var collectorErr, applicationErr bytes.Buffer
+	collector.Stderr = &collectorErr
 	if err := collector.Start(); err != nil {
 		t.Fatal(err)
+	}
+	ready := bufio.NewReader(output)
+	if line, err := ready.ReadString('\n'); err != nil || line != "ready\n" {
+		_ = collector.Process.Kill()
+		_ = collector.Wait()
+		t.Fatalf("collector readiness = %q, error = %v; stderr: %s", line, err, &collectorErr)
 	}
 	producer := exec.CommandContext(ctx, application)
 	producer.Stdout, producer.Stderr = input, &applicationErr
 	producerErr := producer.Run()
 	closeErr := input.Close()
+	collectorOut, readErr := io.ReadAll(ready)
 	collectorResult := collector.Wait()
-	if producerErr != nil || closeErr != nil || collectorResult != nil {
-		t.Fatalf("application=%v pipe=%v collector=%v\napplication stderr: %s\ncollector stderr: %s", producerErr, closeErr, collectorResult, &applicationErr, &collectorErr)
+	if producerErr != nil || closeErr != nil || readErr != nil || collectorResult != nil {
+		t.Fatalf("application=%v pipe=%v output=%v collector=%v\napplication stderr: %s\ncollector stderr: %s", producerErr, closeErr, readErr, collectorResult, &applicationErr, &collectorErr)
 	}
-	if collectorOut.Len() != 0 || collectorErr.Len() != 0 || applicationErr.Len() != 0 {
+	if len(collectorOut) != 0 || collectorErr.Len() != 0 || applicationErr.Len() != 0 {
 		t.Fatal("unexpected process output")
 	}
 	mu.Lock()

@@ -73,7 +73,14 @@ func TestRunPreservesJournalErrors(t *testing.T) {
 	}
 	t.Run("destination mismatch", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := run(t, dir, "first-target"); err != nil {
+		store, err := journal.Open(dir, "first-target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Append(json.RawMessage(`{"pending":true}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
 		if err := run(t, dir, "second-target"); !errors.Is(err, journal.ErrDestinationMismatch) {

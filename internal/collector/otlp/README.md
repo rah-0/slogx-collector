@@ -37,10 +37,11 @@ requires unique attribute keys, so the last duplicate key wins during conversion
 
 `-resource Name=Value` supplies trace resource attributes such as `service.name`.
 These values belong to collector configuration and are included in the journal
-identity. Changing resources while reusing a journal is rejected, preventing
-pending spans from being relabelled on replay. `-field Name=Value` instead adds
-or overrides root record attributes before journaling; on spans, these become
-span attributes.
+identity. Changing resources while records are pending is rejected, preventing
+spans from being relabelled on replay. A fully drained journal can adopt
+new resources after its durable checkpoint is validated at startup.
+`-field Name=Value` instead adds or overrides root record attributes before
+journaling; on spans, these become span attributes.
 
 ## Command configuration
 

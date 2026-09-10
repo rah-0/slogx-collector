@@ -37,6 +37,12 @@ func Run(ctx context.Context, args []string, input io.ReadCloser, stdout, stderr
 	if cfg.check {
 		return exitSuccess
 	}
+	if cfg.ready {
+		cfg.options.OnReady = func() error {
+			_, err := io.WriteString(stdout, "ready\n")
+			return err
+		}
+	}
 	cfg.options.OnRetry = func(err error, delay time.Duration) {
 		fmt.Fprintf(stderr, "slogx-collector: %v; retrying in %s\n", err, delay)
 	}

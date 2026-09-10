@@ -54,6 +54,10 @@ type Options struct {
 	// ShutdownTimeout defaults to ten seconds to deliver journaled records
 	// after cancellation. Undelivered records remain in the journal.
 	ShutdownTimeout time.Duration
+	// OnReady runs once after the journal opens, before ingestion or delivery.
+	// It must return promptly. An error aborts collection and closes the journal.
+	// Readiness does not verify destination availability or authentication.
+	OnReady func() error
 	// OnRetry is called before a retry delay. It must return promptly.
 	OnRetry func(error, time.Duration)
 }
@@ -129,6 +133,11 @@ func Run(ctx context.Context, input io.ReadCloser, destination Destination, opti
 		return err
 	}
 	defer func() { result = errors.Join(result, store.Close()) }()
+	if options.OnReady != nil {
+		if err := options.OnReady(); err != nil {
+			return fmt.Errorf("collector: signal readiness: %w", err)
+		}
+	}
 
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

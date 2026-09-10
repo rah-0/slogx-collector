@@ -35,7 +35,8 @@ bash examples/replay/run.sh replay \
 
 Set the selected password environment variable before running that command.
 `COLLECTOR_BIN` can select a different collector executable. Keep the destination
-endpoint unchanged because the journal is bound to its destination identity.
+endpoint unchanged while replaying pending records. Once fully drained, the
+journal can accept a new destination identity after startup validation.
 Delivery is at least once: losing an acknowledgment after remote acceptance can
 cause duplicates on replay.
 

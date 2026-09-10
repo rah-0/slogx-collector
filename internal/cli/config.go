@@ -15,6 +15,7 @@ const defaultRequestTimeout = 10 * time.Second
 
 type commandConfig struct {
 	check           bool
+	ready           bool
 	input           string
 	destination     string
 	endpoint        string
@@ -50,6 +51,7 @@ func parseConfig(args []string, stdout io.Writer) (commandConfig, error) {
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {}
 	flags.BoolVar(&cfg.check, "check", false, "Validate configuration and credential sources, then exit without reading input, opening the journal, or contacting the destination")
+	flags.BoolVar(&cfg.ready, "ready", false, "Write ready to stdout after opening the journal, before reading input or delivering records")
 	flags.StringVar(&cfg.input, "input", "stdin", "Input source (stdin)")
 	flags.StringVar(&cfg.destination, "destination", "", "Output adapter (required: openobserve or otlp; see adapters above)")
 	flags.StringVar(&cfg.endpoint, "endpoint", "", "Complete ingestion URL for the selected output adapter (required)")

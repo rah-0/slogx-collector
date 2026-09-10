@@ -46,8 +46,11 @@ or `-header-env` when a secret should stay out of process arguments.
 Use a dedicated journal directory for each collector and destination. It is created when
 needed, locked while running, and bound to the destination type and URL. Trace journals also
 include the traces endpoint, `stream-name` header, and configured resource attributes in this
-identity. Changing that identity fails before sending its backlog. Preserve the directory across
-restarts; use a new journal when changing trace resource metadata.
+identity. Changing that identity fails while unacknowledged records remain. After a complete
+drain, startup validates the durable checkpoint and atomically binds the journal to the new
+identity under its exclusive lock. Invalid journal state prevents this change. Preserve the
+directory across restarts; drain under the original configuration before changing destinations
+or trace resource metadata, or use a separate journal while retaining the old backlog.
 
 ## Checking configuration
 
@@ -70,6 +73,21 @@ Credential values are not printed.
 The check does not verify remote authentication or availability, journal contents, locking,
 or filesystem permissions. It can run while another collector owns the journal. Supply the
 same `-journal-dir` and other arguments intended for collection; required flags still apply.
+`-check -ready` remains a silent configuration check and emits no readiness signal.
+
+## Startup readiness
+
+Add `-ready` to a normal collection command to write exactly `ready\n` to stdout once
+the journal is locked, opened, and has passed startup validation, including any permitted
+destination identity change. The signal is written before reading input or sending records.
+A supervisor can wait for that line before starting the producer, keeping the collector's
+stdin pipe open while it waits.
+
+Configuration or journal startup failures emit no readiness signal and exit unsuccessfully.
+Failure to write the signal also stops collection. Readiness confirms local startup only;
+it does not check remote authentication or availability, promise delivery, or acknowledge
+any input record. Continue monitoring the collector's exit status after startup. Without
+`-ready`, collection remains silent on stdout.
 
 ## Input contract
 
@@ -255,6 +273,7 @@ shutdown. See the [trace destination contract](otlp/README.md) for conversion an
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-check` | `false` | Validate configuration and credential sources, then exit without reading input, opening the journal, or contacting the destination. |
+| `-ready` | `false` | Write `ready\n` to stdout once after local journal startup, before input or delivery; has no effect with `-check`. |
 | `-input` | `stdin` | Input mode; stdin is currently the only implementation. |
 | `-destination` | Required | Output adapter: `openobserve` integrates its JSON logs API with optional OTLP traces; `otlp` delivers only traces to a compatible OTLP HTTP/JSON endpoint. |
 | `-endpoint` | Required | Complete destination ingestion URL. |
@@ -286,7 +305,7 @@ HTTP uses Go's standard proxy environment variables and system certificate trust
 
 Exit status is `0` after a complete EOF drain, a successful check, or help, `2` for invalid configuration, and `1`
 for runtime errors or interruption, including an interruption whose drain completed.
-Runtime diagnostics go to stderr; stdout is reserved for help output.
+Runtime diagnostics go to stderr; stdout carries help output or the optional readiness signal.
 
 ## Extending the collector
 
@@ -306,6 +325,10 @@ err := collector.Run(ctx, input, destination, collector.Options{
     JournalKey: "stable-destination-identity",
 })
 ```
+
+`collector.Options.OnReady`, when set, runs once after journal startup and before input or
+delivery. Returning an error aborts `Run` and closes the journal and input. The CLI uses this
+hook for `-ready`.
 
 `Send` must honor its context, leave records unchanged, and not retain the batch after
 returning. Nil acknowledges the entire batch. Ordinary errors are terminal; return a

@@ -17,6 +17,9 @@ Pass the intended collection arguments after the script name, including trace
 routing flags when applicable. A check can run while another collector owns the
 journal. It validates configuration, not remote authentication, availability,
 journal health, or filesystem permissions.
+For a signal after local journal startup, use `-ready` during collection; see
+[startup readiness](../../internal/collector/README.md#startup-readiness).
+Combining `-check` with `-ready` remains silent and does not open the journal.
 
 Credential alternatives include `-password-file /path/to/password` and
 `-header-env Authorization=INGEST_AUTHORIZATION`. Set the selected variable to
